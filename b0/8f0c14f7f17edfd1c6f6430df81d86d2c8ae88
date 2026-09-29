@@ -1,0 +1,22 @@
+test/registered/kernels/benchmark/attention/bench_topk.py
+  s_caea82194b56ed::t_bfd22afab9f0d5 156-159,167
+  s_caea82194b56ed::t_ef44ec418a68cb 4,9,145-155,160-166,168-172,176
+test/registered/kernels/ops/attention/test_topk_v2.py
+  s_caea82194b56ed::t_beb3142e688937 455-464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b08f0c14f7f17edfd1c6f6430df81d86d2c8ae88",
+  "prompts": {},
+  "sessions": {
+    "s_caea82194b56ed": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e861-b307-7930-a043-e2c67d6eaa2f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
