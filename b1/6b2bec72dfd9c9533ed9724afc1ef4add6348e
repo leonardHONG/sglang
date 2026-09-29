@@ -1,0 +1,37 @@
+test/registered/kernels/ops/attention/test_topk_v2.py
+  s_caea82194b56ed::t_ee709d025f4d04 420-504,508,524,539
+  s_caea82194b56ed::t_db4d43c8baf3a9 41,505-507,509-523,525-538
+test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py
+  s_caea82194b56ed::t_5a24698678192d 5,7,235-236,242-285,290-291,297-306,312-314,318-323,327,329-330,335-337,342,349-354,356-357
+  s_caea82194b56ed::t_30273c6112d71e 195-229,286-289,292-296,307-311,315-317,324-326,328,331-334,338-341,343-348,355
+  s_caea82194b56ed::t_31554cba7ea2fc 230-234,358-367
+python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
+  s_caea82194b56ed::t_bfbb1beb6fb2ef 186-190,547-548,567-570
+  s_caea82194b56ed::t_b0199d49d0d74c 651-661,674
+python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
+  s_caea82194b56ed::t_bfbb1beb6fb2ef 129-144,147-152,180-181,306-319,321-329,332,335-353,355-359,994-1019,1030-1037
+  s_caea82194b56ed::t_b0199d49d0d74c 145-146,153-179,320,330-331,333-334,354,1020-1029
+  s_caea82194b56ed::t_e2562dea09afde 1038
+python/sglang/kernels/ops/attention/dsv4/topk.py
+  s_caea82194b56ed::t_bfbb1beb6fb2ef 226-242
+  s_caea82194b56ed::t_0997b1a4d0e955 61-64
+  s_caea82194b56ed::t_bed7f607acc35f 243-244
+python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py
+  s_caea82194b56ed::t_bfbb1beb6fb2ef 27,384-387,401-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b16b2bec72dfd9c9533ed9724afc1ef4add6348e",
+  "prompts": {},
+  "sessions": {
+    "s_caea82194b56ed": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e861-b307-7930-a043-e2c67d6eaa2f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
