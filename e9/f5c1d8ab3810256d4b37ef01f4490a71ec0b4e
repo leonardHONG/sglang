@@ -1,0 +1,25 @@
+test/registered/unit/test_model_overrides.py
+  s_6dad1c5764e62f::t_61dffe8584ffb5 1161-1163,1165-1167
+  s_6dad1c5764e62f::t_2ab472bb8f25a3 1157,1164,1174,1178-1179,1183-1191,1193-1197
+  s_6dad1c5764e62f::t_5a2d941bd98bf1 1192,1198
+python/sglang/srt/arg_groups/model_overrides/mimo_v2.py
+  s_6dad1c5764e62f::t_56d129e731c100 8,27
+  s_6dad1c5764e62f::t_61dffe8584ffb5 26,28
+  s_6dad1c5764e62f::t_c8085272b2e99b 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e9f5c1d8ab3810256d4b37ef01f4490a71ec0b4e",
+  "prompts": {},
+  "sessions": {
+    "s_6dad1c5764e62f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f07c-d0e8-7f82-953e-35ee1031a989",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
