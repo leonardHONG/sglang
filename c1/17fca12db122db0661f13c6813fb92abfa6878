@@ -1,0 +1,44 @@
+python/sglang/srt/layers/attention/triton_backend.py
+  s_28cff6961f9fdc::t_906a7cfd3e2d3d 145,1894-1895
+python/sglang/kernels/ops/attention/extend_attention.py
+  s_28cff6961f9fdc::t_53e7d96fe03085 1255-1262
+  s_28cff6961f9fdc::t_00727e43e368fa 30
+python/sglang/srt/layers/logits_processor.py
+  s_28cff6961f9fdc::t_53e7d96fe03085 29-31,36,941-945,947-949
+  s_28cff6961f9fdc::t_d78926d43494f0 950,953,1152,1158-1164
+python/sglang/srt/layers/attention/flashattention_dense_backend.py
+  s_28cff6961f9fdc::t_c0f12d0d06b7bd 15-17,137-144
+  s_28cff6961f9fdc::t_906a7cfd3e2d3d 23-24,27,64-65,147
+  s_28cff6961f9fdc::t_dba2fa16e9d86f 13,145
+python/sglang/kernels/ops/attention/flash_attn/cute/sm100_hd256_2cta_fmha_forward.py
+  s_28cff6961f9fdc::t_906a7cfd3e2d3d 344-351,354
+python/sglang/srt/layers/attention/graph_variants.py
+  s_28cff6961f9fdc::t_c0f12d0d06b7bd 15-16,28-63
+  s_28cff6961f9fdc::t_b8af0ad44385ac 64-65
+python/sglang/kernels/ops/activation/softcap.py
+  s_28cff6961f9fdc::t_53e7d96fe03085 78-80,91-92,99-102,105-106,126-130,132-138
+  s_28cff6961f9fdc::t_739e04991ff4bf 139-140
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  s_28cff6961f9fdc::t_c0f12d0d06b7bd 52,54,94-95,109,320-322,1127-1131
+  s_28cff6961f9fdc::t_f684ba9f9799e6 42
+python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=128,N=704,device_name=NVIDIA_B300_SXM6_AC.json
+  s_28cff6961f9fdc::t_36b012d7160b6a 1-46
+python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=128,N=704,device_name=NVIDIA_B300_SXM6_AC_down.json
+  s_28cff6961f9fdc::t_209aa012595fb8 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c117fca12db122db0661f13c6813fb92abfa6878",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
