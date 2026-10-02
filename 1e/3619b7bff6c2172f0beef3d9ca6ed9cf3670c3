@@ -1,0 +1,74 @@
+python/sglang/srt/layers/attention/flashattention_dense_backend.py
+  s_28cff6961f9fdc::t_42a1fd49a3e013 58-59,61,63,74,184,186-187,190-194,262,265-266,273,286
+  s_28cff6961f9fdc::t_824f7475cee6a4 57,62,64-71,267,269-270,298,302-303,309,315,331,338
+  s_28cff6961f9fdc::t_ea1d52043fbbc8 319
+  s_28cff6961f9fdc::t_8aa5b68e27a07e 31,60
+  s_28cff6961f9fdc::t_88d056b1788cd3 72-73,75,107,176-178,185,268,274-277,287-288,297,316,329-330,332,339,342
+python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py
+  s_28cff6961f9fdc::t_236e3b7527ff37 15,65,127-134
+  s_28cff6961f9fdc::t_ed944b6d85e7e6 64,92,110-111
+python/sglang/srt/layers/attention/tbo_backend.py
+  s_28cff6961f9fdc::t_42a1fd49a3e013 47-51
+python/sglang/srt/layers/attention/hybrid_attn_backend.py
+  s_28cff6961f9fdc::t_42a1fd49a3e013 113-117
+  s_28cff6961f9fdc::t_1710d2e4a6c5a6 16,146,153,185
+python/sglang/kernels/ops/layernorm/gemma4_fused_ops.py
+  s_28cff6961f9fdc::t_ea1d52043fbbc8 13-14,282
+python/sglang/kernels/ops/attention/dense_kv.py
+  s_28cff6961f9fdc::t_824f7475cee6a4 105-113
+  s_28cff6961f9fdc::t_0fc53df1d0d67f 35-38,42,44
+python/sglang/srt/arg_groups/dllm_hook.py
+  s_28cff6961f9fdc::t_5ac15131379ce1 32
+  s_28cff6961f9fdc::t_0fc53df1d0d67f 29
+python/sglang/srt/layers/attention/graph_variants.py
+  s_28cff6961f9fdc::t_08886424ebd458 45-46
+  s_28cff6961f9fdc::t_ea1d52043fbbc8 38,48-49,52-53
+python/sglang/kernels/ops/layernorm/rmsnorm_fanout.py
+  s_28cff6961f9fdc::t_ef329afba314d0 4,6-9,16-25,47-56
+  s_28cff6961f9fdc::t_ed944b6d85e7e6 1-3,5,11,13-15,34-36,44,60-70,84,89-94,97-99,114-118,121-123,126-128,132,135-138,141-151,153-156,158-163,165-178,185-195,197-198
+  s_28cff6961f9fdc::t_9ed24be1b36a7f 10,12,26-33,37-43,45-46,57-59
+  s_28cff6961f9fdc::t_b51c1ad20dfaad 71-83,85-88,95-96,100-113,119-120,124-125,129-131,133-134,139-140,152,157,164,179-184,196
+python/sglang/kernels/ops/speculative/row_argmax.py
+  s_28cff6961f9fdc::t_ef329afba314d0 98-105,113-122
+  s_28cff6961f9fdc::t_b14a6b7b58afca 71-72,78-80,97,106-112,123-127
+  s_28cff6961f9fdc::t_c9726e85cb5587 128-129
+python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+  s_28cff6961f9fdc::t_42a1fd49a3e013 1388-1395
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_28cff6961f9fdc::t_42a1fd49a3e013 168-172
+  s_28cff6961f9fdc::t_37870c9f6ddc3b 173
+python/sglang/srt/dllm/algorithm/gemma4_renoise.py
+  s_28cff6961f9fdc::t_b14a6b7b58afca 42-45,175-176,252,265-268,272-286,288-289,320-326,329-332,383,397-398
+  s_28cff6961f9fdc::t_bde4b315d66494 258
+  s_28cff6961f9fdc::t_0fc53df1d0d67f 8-11,80-87
+python/sglang/srt/models/gemma4_diffusion.py
+  s_28cff6961f9fdc::t_2419a6b59478fe 338,346,358,360-361,363
+  s_28cff6961f9fdc::t_cd3803f8c9accd 27,344
+  s_28cff6961f9fdc::t_ef329afba314d0 342
+  s_28cff6961f9fdc::t_3d4d7bf5071f07 168-173,340
+  s_28cff6961f9fdc::t_42a1fd49a3e013 24,26,63,174-175,188-189,212-213,339,341,343,347-349,354-357,364-365
+  s_28cff6961f9fdc::t_2fb4c0d43e783c 176-187,350-353,359,362
+python/sglang/kernels/ops/attention/gemma_qkv_norm_rope.py
+  s_28cff6961f9fdc::t_236e3b7527ff37 17-35,40-71,76-85,89-102,105-122
+  s_28cff6961f9fdc::t_ed944b6d85e7e6 1-16,36-39,72-75,86-88,103-104,123-124
+python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=128,N=704,device_name=NVIDIA_B300_SXM6_AC.json
+  s_28cff6961f9fdc::t_9dd424b2cc1424 40-156
+python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=128,N=704,device_name=NVIDIA_B300_SXM6_AC_down.json
+  s_28cff6961f9fdc::t_40dce09b053779 41-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1e3619b7bff6c2172f0beef3d9ca6ed9cf3670c3",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
