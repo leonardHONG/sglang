@@ -1,0 +1,20 @@
+test/registered/unit/dllm/algorithm/test_gemma4_sampling_cuda.py
+  s_530a015d7a9e10::t_0729269c780b6c 9,15,29,41-128
+  s_530a015d7a9e10::t_f9eb171d1f78db 129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7c09227910d3d2ac4b084cff35c3cf5b7b466d0a",
+  "prompts": {},
+  "sessions": {
+    "s_530a015d7a9e10": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fa4e-3b96-76b2-a6ef-b4a9a2426e69",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}

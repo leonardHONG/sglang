@@ -1,0 +1,59 @@
+python/sglang/kernels/ops/attention/flash_attention_v4.py
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 4,32-36,87-88,110
+  s_28cff6961f9fdc::t_5d908a22152d18 69,111,116
+python/sglang/kernels/ops/attention/flash_attn/cute/flash_fwd_mla_sm100.py
+  s_28cff6961f9fdc::t_5d908a22152d18 356-377
+  s_28cff6961f9fdc::t_c62119d63a53ae 400-401
+python/sglang/srt/layers/attention/attention_registry.py
+  s_28cff6961f9fdc::t_dcce1a84fd8697 256-258,260
+python/sglang/srt/layers/attention/flashattention_dense_backend.py
+  s_28cff6961f9fdc::t_dcce1a84fd8697 13-27,39-44,47-49,53-54,57,63-65,67-76,78-156,158-164,166,188-192,226
+  s_28cff6961f9fdc::t_76211bcc476a74 58-62,193
+  s_28cff6961f9fdc::t_5e8d2c8b02fbdd 55,66,157
+  s_28cff6961f9fdc::t_2a041a6e55c98e 32
+  s_28cff6961f9fdc::t_d378ee9de3353c 31,36,56,194-195,203-204,224-225,228,251,282-286
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_28cff6961f9fdc::t_e180de5eb5a1c0 164-167
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 168-180
+  s_28cff6961f9fdc::t_089d51cec679f8 16,181
+python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+  s_28cff6961f9fdc::t_d81327e298efcd 1195-1199
+python/sglang/kernels/ops/activation/softcap.py
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 106-107,118-121,146
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 311
+  s_28cff6961f9fdc::t_397a592af48d17 600-602
+  s_28cff6961f9fdc::t_16115a07a36daa 604-608,722,1133,1374,1507
+python/sglang/srt/layers/attention/linear/inkling_sconv_backend.py
+  s_28cff6961f9fdc::t_d81327e298efcd 668-671
+python/sglang/srt/layers/attention/hybrid_attn_backend.py
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 97-99,104-107
+  s_28cff6961f9fdc::t_2a041a6e55c98e 109-111,140-142,147-148,177-182
+  s_28cff6961f9fdc::t_c8db1aaedae70e 143
+  s_28cff6961f9fdc::t_1427754b27f3fc 96,108
+python/sglang/srt/layers/attention/graph_variants.py
+  s_28cff6961f9fdc::t_397a592af48d17 24-27,37-42
+  s_28cff6961f9fdc::t_f63c6d7d7105f1 20-22
+  s_28cff6961f9fdc::t_2b13f8ea89b4d0 46,63-68,120-125
+python/sglang/srt/layers/attention/tbo_backend.py
+  s_28cff6961f9fdc::t_2a041a6e55c98e 44-46
+  s_28cff6961f9fdc::t_d81327e298efcd 35-43
+python/sglang/srt/layers/attention/triton_backend.py
+  s_28cff6961f9fdc::t_d0ace04ec3dae7 1799-1800,1829-1831
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "902d8c4219f9cd52d71f9cbdedd04463071031e6",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}

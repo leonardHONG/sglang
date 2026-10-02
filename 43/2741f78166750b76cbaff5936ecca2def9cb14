@@ -1,0 +1,61 @@
+python/sglang/srt/models/gemma4_diffusion.py
+  s_28cff6961f9fdc::t_f3f8f0aa64e250 482-485
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_28cff6961f9fdc::t_89c968cb10bc26 185
+python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+  s_28cff6961f9fdc::t_89c968cb10bc26 502-504
+  s_28cff6961f9fdc::t_1988074244f33c 2131-2133,2150
+python/sglang/srt/layers/attention/attention_registry.py
+  s_28cff6961f9fdc::t_f4745209d0dfaf 257-259
+  s_28cff6961f9fdc::t_77d58f88208712 256,260-264
+python/sglang/kernels/ops/attention/dense_kv.py
+  s_28cff6961f9fdc::t_81c96926f91ff9 11-33,46-61,71-91,97-99
+  s_28cff6961f9fdc::t_d2b586e800a212 1-10,34-45,62-70,92-96,100-102
+python/sglang/srt/arg_groups/overrides.py
+  s_28cff6961f9fdc::t_f4745209d0dfaf 1234-1235
+  s_28cff6961f9fdc::t_1bed3f1477ad3c 1594
+  s_28cff6961f9fdc::t_1410cfca50f7fb 1236-1238,1595-1599
+python/sglang/srt/dllm/algorithm/gemma4_renoise.py
+  s_28cff6961f9fdc::t_1bed3f1477ad3c 47-48,72-76,82,160-162,263-292
+  s_28cff6961f9fdc::t_10d3763722bead 293-301,338
+python/sglang/kernels/ops/attention/flash_attention_v4.py
+  s_28cff6961f9fdc::t_d2b586e800a212 41,47,49,72,83,103
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  s_28cff6961f9fdc::t_f3f8f0aa64e250 66-67,285-291,475-485,1245-1253,1313-1317,1331-1335
+  s_28cff6961f9fdc::t_81c96926f91ff9 235
+  s_28cff6961f9fdc::t_56e4de7eb44787 1336
+  s_28cff6961f9fdc::t_7929b5fe518d62 236
+python/sglang/srt/dllm/algorithm/base.py
+  s_28cff6961f9fdc::t_1bed3f1477ad3c 38-39
+python/sglang/srt/dllm/config.py
+  s_28cff6961f9fdc::t_1bed3f1477ad3c 18,27,118-120
+  s_28cff6961f9fdc::t_f02af52a3de93f 121
+python/sglang/srt/model_executor/forward_batch_info.py
+  s_28cff6961f9fdc::t_f3f8f0aa64e250 559
+python/sglang/srt/layers/attention/triton_backend.py
+  s_28cff6961f9fdc::t_2841c43dd3ad60 857-861
+  s_28cff6961f9fdc::t_f8861ad254bc10 871
+  s_28cff6961f9fdc::t_89c968cb10bc26 144,717-719,774,776,788-794,798-799,803,816,826-828,834-838,847-851,855-856,862-864,867-869,872
+  s_28cff6961f9fdc::t_77d58f88208712 160-161,165-167,510,512-513,865-866,870
+  s_28cff6961f9fdc::t_89a6bb18e286c8 162-164,751,795-797,800-802,804-815,817-825,829-833,839-846,852-854
+  s_28cff6961f9fdc::t_955c85b5d7e1a1 873
+python/sglang/srt/layers/attention/flashattention_dense_backend.py
+  s_28cff6961f9fdc::t_77d58f88208712 1-9,13-16,19-25,44-55,73-74,78-86,98-102,118-121,130-131,142
+  s_28cff6961f9fdc::t_f8861ad254bc10 10-12,17-18,26-43,56-72,75-77,87-97,103-117,122-129,132-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "432741f78166750b76cbaff5936ecca2def9cb14",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
