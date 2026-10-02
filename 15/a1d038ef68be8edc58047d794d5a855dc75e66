@@ -1,0 +1,60 @@
+python/sglang/kernels/ops/activation/__init__.py
+  h_6d2f41c1f60461 347-360
+python/sglang/kernels/ops/attention/__init__.py
+  h_6d2f41c1f60461 362-398
+python/sglang/kernels/ops/layernorm/__init__.py
+  h_6d2f41c1f60461 583-597
+python/sglang/kernels/ops/sampling/__init__.py
+  h_6d2f41c1f60461 103-116
+python/sglang/kernels/ops/sampling/denoiser_statistics.py
+  h_6d2f41c1f60461 1-201
+python/sglang/kernels/ops/speculative/__init__.py
+  h_6d2f41c1f60461 9-14,45-57
+python/sglang/srt/dllm/algorithm/gemma4_renoise.py
+  h_6d2f41c1f60461 37-58,388-403,452-456
+python/sglang/srt/layers/attention/flashattention_dense_backend.py
+  h_6d2f41c1f60461 7,35-53,283,293
+python/sglang/srt/layers/attention/graph_variants.py
+  h_6d2f41c1f60461 20-21
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  h_6d2f41c1f60461 1133
+test/registered/kernels/ops/activation/test_softcap_cast.py
+  h_6d2f41c1f60461 1-64
+test/registered/kernels/ops/attention/test_dense_fa4.py
+  h_6d2f41c1f60461 1-180
+test/registered/kernels/ops/attention/test_flash_attention_4.py
+  h_6d2f41c1f60461 18,1799-1861
+test/registered/kernels/ops/attention/test_fused_qk_rmsnorm_rope_gate.py
+  h_6d2f41c1f60461 184-198
+test/registered/kernels/ops/layernorm/test_gemma4_qkv_norm.py
+  h_6d2f41c1f60461 16-112
+test/registered/kernels/ops/speculative/test_spec_kv_indices_grid.py
+  h_6d2f41c1f60461 77-131
+test/registered/kernels/ops/speculative/test_speculative_sampling.py
+  h_6d2f41c1f60461 7-8,222-261
+test/registered/unit/dllm/test_gemma4_cuda_graph.py
+  h_6d2f41c1f60461 10-17,25,32,47,55-73,75,86-88,91-129,214,251-261,263
+test/registered/unit/dllm/test_gemma4_renoise.py
+  h_6d2f41c1f60461 7,19,36-60,127-174,268,272-273,278,287-315,385-387,411,474,476-478
+test/registered/unit/kernels/test_kernels_namespace.py
+  h_6d2f41c1f60461 175-181,248-249,267,274
+test/registered/unit/layers/attention/test_triton_verify_metadata.py
+  h_6d2f41c1f60461 79
+test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py
+  h_6d2f41c1f60461 3,7-10,12-13,25-71
+test/registered/unit/model_executor/test_prefill_cuda_graph_runner.py
+  h_6d2f41c1f60461 176
+test/registered/unit/test_model_overrides.py
+  h_6d2f41c1f60461 3237-3240,3294-3308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "15a1d038ef68be8edc58047d794d5a855dc75e66",
+  "prompts": {},
+  "humans": {
+    "h_6d2f41c1f60461": {
+      "author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
