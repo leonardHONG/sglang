@@ -48,6 +48,7 @@ python/sglang/srt/models/gemma4_diffusion.py
   s_28cff6961f9fdc::t_3d4d7bf5071f07 168-173,340
   s_28cff6961f9fdc::t_42a1fd49a3e013 24,26,174-175,188-189,212-213,339,341,343,347-349,354-357,364-365
   s_28cff6961f9fdc::t_2fb4c0d43e783c 176-187,350-353,359,362
+  s_530a015d7a9e10::t_6214be1726c2f1 63
 python/sglang/kernels/ops/attention/gemma_qkv_norm_rope.py
   s_28cff6961f9fdc::t_236e3b7527ff37 17-35,40-71,76-85,89-102,105-122
   s_28cff6961f9fdc::t_ed944b6d85e7e6 1-16,36-39,72-75,86-88,103-104,123-124
@@ -67,6 +68,14 @@ python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=128,
         "tool": "codex",
         "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
         "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    },
+    "s_530a015d7a9e10": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fa4e-3b96-76b2-a6ef-b4a9a2426e69",
+        "model": "gpt-6.1-sol"
       },
       "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
     }
