@@ -1,0 +1,28 @@
+python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+  s_dec16376a75d0f::t_000b2a88fd9625 105,115-116,175,223,275
+python/sglang/srt/layers/attention/dsa/kpool_plan.py
+  s_dec16376a75d0f::t_000b2a88fd9625 587,594-603,634,638-639
+  s_dec16376a75d0f::t_4ea395bc5055c3 640-641
+python/sglang/srt/speculative/dflash_worker_v2.py
+  s_dec16376a75d0f::t_000b2a88fd9625 1183-1187,2536-2539
+python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+  s_dec16376a75d0f::t_000b2a88fd9625 809-816
+python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py
+  s_dec16376a75d0f::t_000b2a88fd9625 7,101,332-342,443-457,580
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d7526e3eb4141b698a79b04571396ee7222f04d6",
+  "prompts": {},
+  "sessions": {
+    "s_dec16376a75d0f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
