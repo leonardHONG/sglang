@@ -1,0 +1,75 @@
+python/sglang/kernels/ops/attention/flash_attention_v4.py
+  s_b4f5f55fb3dca9::t_f26e6dc44b002f 78,83-87,89-91,110
+python/sglang/kernels/ops/layernorm/__init__.py
+  s_7051170aa916f9::t_013131fd42e0d8 594
+python/sglang/kernels/ops/layernorm/rmsnorm_fanout.py
+  s_a95bd15edf2128::t_cfbc0536628010 7,14,16-20,22-39,51-52,74
+python/sglang/kernels/ops/sampling/denoiser_statistics.py
+  s_a95bd15edf2128::t_82834d9ce90c49 143-146
+python/sglang/kernels/ops/speculative/row_argmax.py
+  s_b4f5f55fb3dca9::t_3123fec08bf153 106-109,125,139-140
+python/sglang/srt/dllm/algorithm/gemma4_renoise.py
+  s_a95bd15edf2128::t_98512999bf0b0b 48-49,53-58,305,312,391-399
+python/sglang/srt/layers/attention/attention_registry.py
+  s_b4f5f55fb3dca9::t_db040102c1d607 256-257,259
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_b4f5f55fb3dca9::t_7ad7303427e3e7 162
+python/sglang/srt/layers/attention/graph_variants.py
+  s_b4f5f55fb3dca9::t_604322059afcf2 18-19,21-22,32,84
+python/sglang/srt/layers/attention/hybrid_attn_backend.py
+  s_b4f5f55fb3dca9::t_d4519c012f3669 98-99
+python/sglang/srt/layers/attention/tbo_backend.py
+  s_b4f5f55fb3dca9::t_23c83a69ab18db 36-37
+python/sglang/srt/layers/attention/triton_backend.py
+  s_a95bd15edf2128::t_0d67690240f88d 157-158,390-392,416-420,717-723,831-832,1095-1096,1817-1818,1845-1846
+python/sglang/srt/model_executor/forward_batch_info.py
+  s_b4f5f55fb3dca9::t_af17e889ddfc7a 559
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  s_a95bd15edf2128::t_b46df57f2c5884 52-53,224-225,275,279,313,315-318,323-328,474,478,617-619,1248,1252,1254,1318,1334-1340
+python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+  s_7051170aa916f9::t_fa8ba5909bc7d0 291,301-305,488-491,518,1419-1421
+python/sglang/srt/models/gemma4_diffusion.py
+  s_a95bd15edf2128::t_8641108b8e14cf 26-29,320,342,529
+test/registered/unit/dllm/algorithm/test_gemma4_sampling_cuda.py
+  s_a95bd15edf2128::t_f9f1330b3fbddb 9,20-59,65,69
+test/registered/unit/dllm/test_gemma4_cuda_graph.py
+  s_7051170aa916f9::t_6b45c48f82c861 10,46,48,145,183
+test/registered/unit/dllm/test_gemma4_renoise.py
+  s_b4f5f55fb3dca9::t_24b97be466124c 48,101,195-215,219,395-396
+test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py
+  s_b4f5f55fb3dca9::t_a5c86a4e11db57 3
+test/registered/unit/test_model_overrides.py
+  s_b4f5f55fb3dca9::t_ce948b733dc7be 3238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "071f600dc00382f72ce928879a0ccb6219c7bca7",
+  "prompts": {},
+  "sessions": {
+    "s_7051170aa916f9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10739-0fb8-7180-9b5a-f6468abe8c93",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    },
+    "s_a95bd15edf2128": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a107a9-cf6a-78b2-9373-4996317878ec",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    },
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
