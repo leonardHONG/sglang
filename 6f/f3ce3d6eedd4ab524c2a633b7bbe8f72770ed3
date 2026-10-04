@@ -1,0 +1,25 @@
+python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py
+  s_dec16376a75d0f::t_02b67581c0840d 333,444,450,516
+python/sglang/srt/layers/quantization/fp8.py
+  s_dec16376a75d0f::t_02b67581c0840d 2561-2575
+python/sglang/kernels/ops/attention/fla/fused_norm_gate.py
+  s_dec16376a75d0f::t_02b67581c0840d 226,228,232
+python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+  s_dec16376a75d0f::t_02b67581c0840d 105-113,174-182,221-229,272-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6ff3ce3d6eedd4ab524c2a633b7bbe8f72770ed3",
+  "prompts": {},
+  "sessions": {
+    "s_dec16376a75d0f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
