@@ -1,0 +1,61 @@
+test/registered/unit/model_executor/runner/test_flashinfer_autotune_sync.py
+  s_dec16376a75d0f::t_2ab5ae21e5876f 81-104,127
+  s_dec16376a75d0f::t_4c754ae5e142c5 105-126,128
+python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
+  s_dec16376a75d0f::t_25be743c7ec788 232,245
+  s_28cff6961f9fdc::t_721b31093ae2d4 233,235,238-239,242,247-248,741,908,943
+  s_28cff6961f9fdc::t_173f4d9d357a08 51,234,236,240-241,243-244,246,249-256,260-263,766,804-806
+  s_dec16376a75d0f::t_dca874aacf8264 237
+  s_dec16376a75d0f::t_f36dad9ae1803f 257-259
+test/registered/kernels/ops/attention/test_dsa_metadata_replay.py
+  s_dec16376a75d0f::t_000b2a88fd9625 9-10,16,30-54
+python/sglang/srt/layers/quantization/fp8.py
+  s_dec16376a75d0f::t_25be743c7ec788 93,2443-2448
+  s_28cff6961f9fdc::t_173f4d9d357a08 35,3119
+  s_dec16376a75d0f::t_dca874aacf8264 2430,2440
+  s_28cff6961f9fdc::t_721b31093ae2d4 2428-2429,2431-2439,2441-2442,3118,3121-3123
+python/sglang/srt/environ.py
+  s_dec16376a75d0f::t_dca874aacf8264 1074
+test/registered/kernels/ops/attention/test_fused_verify_triton_gdn.py
+  s_dec16376a75d0f::t_2ab5ae21e5876f 10-11,327-331,334-357,361-382,384-391
+  s_dec16376a75d0f::t_816093d3831028 332-333
+  s_dec16376a75d0f::t_c07d0381f9188f 358-360
+  s_dec16376a75d0f::t_d2f7549ee9cbce 383
+  s_dec16376a75d0f::t_5a389dfc125df2 392-393
+test/registered/unit/spec/test_dflash_overlap_hostsync.py
+  s_dec16376a75d0f::t_000b2a88fd9625 50-62
+test/registered/unit/layers/quantization/test_fp8_moe_runner_ownership.py
+  s_dec16376a75d0f::t_2ab5ae21e5876f 68,77-79,83,97-99,105-108,113,120-127,131-138,162
+  s_dec16376a75d0f::t_25be743c7ec788 153
+  s_28cff6961f9fdc::t_01f0b40859da75 69-76,80-82,84-87,89-93,100-104
+  s_28cff6961f9fdc::t_173f4d9d357a08 88,94-96,109-112,114-119,128-130,139-144,152,154,158-161
+  s_dec16376a75d0f::t_f36dad9ae1803f 145-151,155-157
+python/sglang/kernels/ops/attention/fla/fused_norm_gate.py
+  s_28cff6961f9fdc::t_c23190b2e147b7 10,227-230
+python/sglang/srt/model_executor/runner/flashinfer_autotune.py
+  s_dec16376a75d0f::t_8e9ae42b159114 156-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "936c3e51c76e211eaa3e648909be498ffb3ef2d2",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    },
+    "s_dec16376a75d0f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
