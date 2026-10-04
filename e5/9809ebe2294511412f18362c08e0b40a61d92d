@@ -1,0 +1,21 @@
+test/registered/unit/layers/quantization/test_fp8_moe_runner_ownership.py
+  s_28cff6961f9fdc::t_0798695973f26d 68,72-77,80,84-92,98-99
+test/registered/kernels/ops/attention/test_dsa_metadata_replay.py
+  s_28cff6961f9fdc::t_0798695973f26d 57-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e59809ebe2294511412f18362c08e0b40a61d92d",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
