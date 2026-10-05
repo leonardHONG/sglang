@@ -48,6 +48,8 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 )
 
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
+_FP8_MOE_BLOCK_K = 128
+_FP8_MOE_SHUFFLE_TILE_M = 64
 
 
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
@@ -226,6 +228,56 @@ def _align_fp8_moe_weights(
     padded_w2[:, :, :intermediate] = w2
 
     return padded_w13, padded_w2, padded_intermediate
+
+
+def prepare_fp8_moe_block_layout(layer: Module) -> None:
+    from flashinfer import shuffle_matrix_a
+    from flashinfer.fused_moe import WeightLayout, convert_to_block_layout
+
+    # Keep logical shapes and Parameter objects for the checkpoint weight loader.
+    for weight in (layer.w13_weight, layer.w2_weight):
+        for expert in weight:
+            shuffled = shuffle_matrix_a(
+                expert.view(torch.uint8), _FP8_MOE_SHUFFLE_TILE_M
+            )
+            blocked = convert_to_block_layout(shuffled, _FP8_MOE_BLOCK_K)
+            expert.view(torch.uint8).copy_(blocked.reshape_as(expert))
+    layer._flashinfer_weight_layout = int(WeightLayout.BlockMajorK)
+
+
+def restore_fp8_moe_block_layout(layer: Module) -> None:
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+    block_k = _FP8_MOE_BLOCK_K
+    for weight in (layer.w13_weight, layer.w2_weight):
+        _, n, k = weight.shape
+        inverse_rows = (
+            get_shuffle_matrix_a_row_indices(weight[0], _FP8_MOE_SHUFFLE_TILE_M)
+            .argsort()
+            .to(weight.device)
+        )
+        for expert in weight:
+            shuffled = (
+                expert.view(torch.uint8)
+                .view(k // block_k, n, block_k)
+                .permute(1, 0, 2)
+                .reshape(n, k)
+            )
+            expert.view(torch.uint8).copy_(shuffled[inverse_rows])
+    layer._flashinfer_weight_layout = 0
+
+
+def get_fp8_moe_weights(layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+    weights = (layer.w13_weight, layer.w2_weight)
+    if getattr(layer, "_flashinfer_weight_layout", 0) == 0:
+        return weights
+    block_k = _FP8_MOE_BLOCK_K
+    return tuple(
+        weight.view(
+            weight.shape[0], weight.shape[2] // block_k, weight.shape[1], block_k
+        )
+        for weight in weights
+    )
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
@@ -705,6 +757,7 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     # Block-quant path
     block_quant: bool
     use_mxfp8: bool = False
+    weight_layout: int = 0
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
@@ -729,7 +782,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
 ) -> StandardCombineInput:
-    from flashinfer.fused_moe import Fp8QuantizationType
+    from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
 
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferDispatchOutput,
@@ -767,7 +820,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         if quant_info.use_mxfp8
         else Fp8QuantizationType.DeepSeekFp8
     )
-    use_shuffled_weight = quant_info.use_mxfp8
+    use_shuffled_weight = (
+        quant_info.use_mxfp8 or quant_info.weight_layout == WeightLayout.BlockMajorK
+    )
     defer_finalize = _deferred_finalize_enabled.get()
     if defer_finalize and (
         not quant_info.block_quant
@@ -869,6 +924,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
+                weight_layout=quant_info.weight_layout,
                 output=symm_output,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
@@ -903,6 +959,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
+                weight_layout=quant_info.weight_layout,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             )
             if defer_finalize:

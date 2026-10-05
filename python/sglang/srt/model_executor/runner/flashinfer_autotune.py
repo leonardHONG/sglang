@@ -153,6 +153,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    if any(
+        getattr(layer, "_flashinfer_weight_layout", 0) for layer in mr.model.modules()
+    ):
+        model_key_parts.append("fp8_moe_weight_layout=block_major_k")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))

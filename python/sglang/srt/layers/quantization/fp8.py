@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
+    get_fp8_moe_weights,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
@@ -88,10 +89,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_platform,
-)
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -104,6 +102,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm100_supported,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -2470,6 +2469,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if getattr(layer, "_flashinfer_weight_layout", 0) != 0:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                restore_fp8_moe_block_layout,
+            )
+
+            restore_fp8_moe_block_layout(layer)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -2610,6 +2617,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
+            if (
+                is_sm100_supported()
+                and self.weight_block_size == [128, 128]
+                and layer.w13_weight.dtype == torch.float8_e4m3fn
+            ):
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    prepare_fp8_moe_block_layout,
+                )
+
+                prepare_fp8_moe_block_layout(layer)
 
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
@@ -3144,9 +3161,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
+            weight_layout = getattr(layer, "_flashinfer_weight_layout", 0)
+            w13, w2 = get_fp8_moe_weights(layer)
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
+                w13_weight=w13,
+                w2_weight=w2,
+                weight_layout=weight_layout,
                 global_num_experts=global_num_experts,
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
