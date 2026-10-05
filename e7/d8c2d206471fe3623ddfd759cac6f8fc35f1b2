@@ -1,0 +1,14 @@
+python/sglang/kernels/ops/attention/fla/fused_norm_gate.py
+  h_6d2f41c1f60461 228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e7d8c2d206471fe3623ddfd759cac6f8fc35f1b2",
+  "prompts": {},
+  "humans": {
+    "h_6d2f41c1f60461": {
+      "author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
