@@ -1,0 +1,23 @@
+python/sglang/kernels/ops/attention/__init__.py
+  s_6c1e64597b5daf::t_959cee9ffaa804 367
+python/sglang/srt/dllm/attention.py
+  s_6c1e64597b5daf::t_add1ee93a7785f 11
+test/registered/unit/kernels/test_kernels_namespace.py
+  s_6c1e64597b5daf::t_ba0e01684a20e8 177,248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ca6de729b48e917a43eba8f77fd27c3f7db79421",
+  "prompts": {},
+  "sessions": {
+    "s_6c1e64597b5daf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10aac-47d8-7bb2-a51b-f8315e843b44",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
