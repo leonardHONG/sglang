@@ -1,0 +1,35 @@
+python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py
+  s_28cff6961f9fdc::t_ebecb0fdecae2c 30-31,33,58-65,464-465,593-597
+  s_28cff6961f9fdc::t_13ea0943128d18 598
+  s_3370a2189b39ae::t_7267e3d59e2aa8 7-14,19,600-607
+python/sglang/kernels/ops/attention/fla/fused_norm_gate.py
+  s_28cff6961f9fdc::t_ab34f5a68e5441 228-233,236-237
+python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
+  s_3370a2189b39ae::t_ec2e18f694483c 732,770
+python/sglang/srt/layers/quantization/fp8.py
+  s_3370a2189b39ae::t_28f88571edd474 3148-3149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6db581bf43505dfec20cdd5e7cb391532a319552",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    },
+    "s_3370a2189b39ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1068c-0775-79b2-a886-4f8c52d2add6",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
