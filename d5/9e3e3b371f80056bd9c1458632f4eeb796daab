@@ -1,0 +1,19 @@
+python/sglang/srt/layers/attention/dsa/kpool_plan.py
+  s_28cff6961f9fdc::t_52ae2af12aba9d 640-645
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d59e3e3b371f80056bd9c1458632f4eeb796daab",
+  "prompts": {},
+  "sessions": {
+    "s_28cff6961f9fdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ed22-3ab7-74c2-8fac-50716b0ec082",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
