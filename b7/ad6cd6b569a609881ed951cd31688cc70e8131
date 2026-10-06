@@ -1,0 +1,19 @@
+test/registered/unit/dllm/test_gemma4_diffusion.py
+  s_3370a2189b39ae::t_59e5cefc1326d8 74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b7ad6cd6b569a609881ed951cd31688cc70e8131",
+  "prompts": {},
+  "sessions": {
+    "s_3370a2189b39ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1068c-0775-79b2-a886-4f8c52d2add6",
+        "model": "unknown"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
