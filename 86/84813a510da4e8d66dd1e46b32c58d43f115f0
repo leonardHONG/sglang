@@ -1,0 +1,37 @@
+python/sglang/srt/models/mimo_v2.py
+  s_b4f5f55fb3dca9::t_ac34610322f0b7 28,40,47-51,67-68,70-72,75,98-103,468-489,520,529,537-550,792-800,813-832,933-937,939,946,1082-1094
+python/sglang/kernels/jit/csrc/elementwise/pos_enc.cuh
+  s_b4f5f55fb3dca9::t_082549af19c34c 11,314-404
+python/sglang/kernels/ops/attention/rope.py
+  s_b4f5f55fb3dca9::t_20610f1fe66ab3 29-58
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_b4f5f55fb3dca9::t_0d984d86a795f2 88-93
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_b4f5f55fb3dca9::t_b0ef873d55d601 1390-1424
+python/sglang/srt/layers/attention/hybrid_attn_backend.py
+  s_b4f5f55fb3dca9::t_0f7bbba64df8c1 93-97
+python/sglang/srt/layers/flashinfer_mnnvl_cutedsl.py
+  s_b4f5f55fb3dca9::t_842c1836b96a3b 323,377-378,380,399,426,495,523
+python/sglang/srt/layers/layer_boundary/fusions/cutedsl.py
+  s_b4f5f55fb3dca9::t_2b17b726d0ee41 86,98,133,135,162,374,410
+python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+  s_b4f5f55fb3dca9::t_af721100444c4f 32-35,45,122-136,140,393-403,405-425,487-488,504,514,516
+python/sglang/srt/layers/rotary_embedding/base.py
+  s_b4f5f55fb3dca9::t_21c55ad502b98d 142-149,164-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8684813a510da4e8d66dd1e46b32c58d43f115f0",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
