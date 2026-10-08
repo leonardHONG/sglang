@@ -1,0 +1,41 @@
+python/sglang/srt/layers/attention/flashattention_backend.py
+  s_b4f5f55fb3dca9::t_4a3a6748f641d8 68,1386-1389,1403-1406,1420-1424,1430
+  s_b4f5f55fb3dca9::t_6e0ee8358708b8 1428
+  s_b4f5f55fb3dca9::t_8232cb805ae66d 69-70,75-76,287,1381-1385,1390-1401,1407-1419,1425-1427,1429,1431-1446,1473,1663,1729,1748,1806,1943,1973,1996
+  s_b4f5f55fb3dca9::t_ce86ba26a0b8d7 71-74,1402
+python/sglang/srt/models/mimo_v2.py
+  s_b4f5f55fb3dca9::t_f9c9bdd3750f2f 27,39,46-50,64-65,67-69,72,94-100,463-482,513,522,530-543,740-747,796-805,818-848,953-957,959,966,1101
+  s_b4f5f55fb3dca9::t_af49ed1a3ae386 1102-1104
+  s_b4f5f55fb3dca9::t_022ba50ff7ce5e 1105-1113
+python/sglang/kernels/jit/csrc/elementwise/pos_enc.cuh
+  s_b4f5f55fb3dca9::t_ce86ba26a0b8d7 11,314-402
+  s_b4f5f55fb3dca9::t_22740f91efc009 403-404
+python/sglang/kernels/ops/attention/rope.py
+  s_b4f5f55fb3dca9::t_f1c5538da379a3 29-58
+python/sglang/srt/layers/attention/base_attn_backend.py
+  s_b4f5f55fb3dca9::t_2f2b30221f84f8 88-93
+python/sglang/srt/layers/attention/hybrid_attn_backend.py
+  s_b4f5f55fb3dca9::t_634b68ad3e9dbe 92-96
+python/sglang/srt/layers/flashinfer_mnnvl_cutedsl.py
+  s_b4f5f55fb3dca9::t_b4b98c6e9bf40f 323,377-379,401,428,497,525
+python/sglang/srt/layers/layer_boundary/fusions/cutedsl.py
+  s_b4f5f55fb3dca9::t_16bf5357dc7e13 86,98,133,135,162,374,410
+python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+  s_b4f5f55fb3dca9::t_b9e6c0cf3d6391 32-35,121-132,388-405,407-418,480-481,497,507,509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "74c473aae14ca595c90318046e253f853ebe873e",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
