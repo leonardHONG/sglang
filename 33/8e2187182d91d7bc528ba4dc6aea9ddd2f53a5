@@ -1,0 +1,20 @@
+python/sglang/srt/models/mimo_v2.py
+  s_b4f5f55fb3dca9::t_aa9fa8cbe54e9b 476
+  s_b4f5f55fb3dca9::t_bd1101aced6197 972-974
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "338e2187182d91d7bc528ba4dc6aea9ddd2f53a5",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
