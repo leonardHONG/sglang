@@ -1,0 +1,27 @@
+python/sglang/srt/layers/flashinfer_mnnvl_cutedsl.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 44,338,340
+test/registered/unit/test_model_overrides.py
+  s_b4f5f55fb3dca9::t_6ba3dacdbb063f 2519-2521,2534-2536
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 2443-2444,2452,2458,2467-2470,2518,2524-2533,2537-2554,2560,2572
+  s_b4f5f55fb3dca9::t_229a37e5e4efb1 2522-2523
+python/sglang/srt/arg_groups/fields/exec_.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 675-676
+python/sglang/srt/arg_groups/overrides.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 917,919-920,922-934,946,954,956,958
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "efe41bfc95604cc7d941f2893b61419a318fff37",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
