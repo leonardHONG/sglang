@@ -1,0 +1,24 @@
+python/sglang/srt/layers/moe/topk.py
+  s_b4f5f55fb3dca9::t_55e951b06a62ec 1691,2396,2600
+python/sglang/srt/models/mimo_v2.py
+  s_b4f5f55fb3dca9::t_55e951b06a62ec 67-72,476-478,482,540-548
+python/sglang/kernels/ops/moe/smallm_router_gfx950/__init__.py
+  s_b4f5f55fb3dca9::t_c8057d450d6a07 118
+  s_b4f5f55fb3dca9::t_5a57e3fa441c9a 93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6f3a9ad14370ae49d6c42299f1a00df5268c1899",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
