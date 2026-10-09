@@ -1,0 +1,23 @@
+python/sglang/srt/arg_groups/fields/exec_.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 675-676
+python/sglang/srt/arg_groups/overrides.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 917,919-920,922-934,946,954,956,958
+python/sglang/srt/layers/flashinfer_mnnvl_cutedsl.py
+  s_b4f5f55fb3dca9::t_bc9b7ff505ca28 44,338,340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "73e87fcf9dfebe6abd60279b0e6066e9d63b8261",
+  "prompts": {},
+  "sessions": {
+    "s_b4f5f55fb3dca9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10737-dc78-76b3-a2b8-714e0e1b910e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "lianghougong <lianghouhong@xiaohongshu.com>"
+    }
+  }
+}
