@@ -5154,9 +5154,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         elif (
             self.fp8_cast_on_write
             and cache_k_nope.dtype == torch.bfloat16
-            and cache_k_rope is not None
-            and cache_k_rope.dtype == torch.bfloat16
-            and cache_k_rope.numel() > 0
+            and (
+                cache_k_rope is None
+                or cache_k_rope.numel() == 0
+                or cache_k_rope.dtype == torch.bfloat16
+            )
         ):
             world = self._write_loc_dcp_span
             rank = get_parallel().attn_dcp_rank if world > 1 else 0

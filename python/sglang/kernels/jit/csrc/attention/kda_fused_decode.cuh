@@ -987,8 +987,8 @@ struct KdaFusedDecodeKernel {
 
     const int64_t kH = A_log.shape()[0];
     RuntimeCheck(
-        kH == 3 || kH == 6 || kH == 8 || kH == 12 || kH == 16,
-        "KDA fused decode supports local head counts 3, 6, 8, 12, or 16, got ",
+        kH == 3 || kH == 6 || kH == 8 || kH == 12 || kH == 16 || kH == 32,
+        "KDA fused decode supports local head counts 3, 6, 8, 12, 16, or 32, got ",
         kH);
     const int64_t kSeg = kH * 128;  // q, k and v segment width
 
@@ -1058,7 +1058,7 @@ struct KdaFusedDecodeKernel {
       kernel = select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages);
     } else if (kH == 6) {
       kernel = select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages);
-    } else if (kH == 8 || kH == 16) {
+    } else if (kH == 8 || kH == 16 || kH == 32) {
       // Measured on H200 at 8/16 heads: evict-first state traffic is 1-9%
       // faster up to 1024 (token, head) blocks and 1-2% slower from 1600;
       // Blackwell was not measured with it, so it keeps the default policy.
@@ -1067,9 +1067,12 @@ struct KdaFusedDecodeKernel {
       if (kH == 8) {
         kernel = stream_state ? select_kda_fused_decode_k3_kernel<8, kUsePDL, true>(use_lower_bound, tma_stages)
                               : select_kda_fused_decode_k3_kernel<8, kUsePDL>(use_lower_bound, tma_stages);
-      } else {
+      } else if (kH == 16) {
         kernel = stream_state ? select_kda_fused_decode_k3_kernel<16, kUsePDL, true>(use_lower_bound, tma_stages)
                               : select_kda_fused_decode_k3_kernel<16, kUsePDL>(use_lower_bound, tma_stages);
+      } else {
+        kernel = stream_state ? select_kda_fused_decode_k3_kernel<32, kUsePDL, true>(use_lower_bound, tma_stages)
+                              : select_kda_fused_decode_k3_kernel<32, kUsePDL>(use_lower_bound, tma_stages);
       }
     }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;

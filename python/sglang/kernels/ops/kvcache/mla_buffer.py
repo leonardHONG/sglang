@@ -370,7 +370,7 @@ def set_mla_kv_buffer_cast_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor],
     *,
     dcp_world_size: int,
     dcp_rank: int,
@@ -378,15 +378,57 @@ def set_mla_kv_buffer_cast_triton(
 ):
     """Scatter bf16 rows into a lower-precision buffer (raw fp8), casting on
     store: one kernel instead of a cast per input plus the copy."""
-    nope_dim, rope_dim = cache_k_nope.shape[-1], cache_k_rope.shape[-1]
+    nope_dim = cache_k_nope.shape[-1]
+    has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
+    paged = paged_layout(kv_buffer)
+    if paged is None:
+        page_size, page_stride, row_stride = 1, 0, kv_buffer.stride(0)
+    else:
+        assert dcp_world_size == 1, "a paged buffer holds rank-local rows"
+        page_size, page_stride, row_stride = paged
+    page_kwargs = {"PAGE_SIZE": page_size, "PAGE_STRIDE": page_stride}
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    if not has_rope:
+        if dcp_world_size == 1:
+            set_mla_kv_buffer_kernel_norope[(loc.numel(), 1)](
+                kv_buffer,
+                cache_k_nope,
+                loc,
+                reserved_skip_index,
+                row_stride,
+                cache_k_nope.stride(0),
+                nope_dim,
+                BLOCK=triton.next_power_of_2(nope_dim),
+                **page_kwargs,
+                **pdl_kwargs,
+            )
+            return
+        set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_nope,
+            loc,
+            reserved_skip_index,
+            row_stride,
+            cache_k_nope.stride(0),
+            cache_k_nope.stride(0),
+            nope_dim,
+            0,
+            BLOCK=triton.next_power_of_2(nope_dim),
+            DCP_RANK=dcp_rank,
+            DCP_WORLD_SIZE=dcp_world_size,
+            **page_kwargs,
+            **pdl_kwargs,
+        )
+        return
+    rope_dim = cache_k_rope.shape[-1]
     set_mla_kv_buffer_kernel[(loc.numel(), 1)](
         kv_buffer,
         cache_k_nope,
         cache_k_rope,
         loc,
         reserved_skip_index,
-        kv_buffer.stride(0),
+        row_stride,
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
         nope_dim,
@@ -394,6 +436,7 @@ def set_mla_kv_buffer_cast_triton(
         BLOCK=triton.next_power_of_2(nope_dim + rope_dim),
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
+        **page_kwargs,
         **pdl_kwargs,
     )
 

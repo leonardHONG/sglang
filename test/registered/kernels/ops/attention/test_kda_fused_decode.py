@@ -140,12 +140,13 @@ def _run_unfused_reference(
         pytest.param(12, 8, id="tp8_h12"),
         pytest.param(8, 8, id="glm53_flash_tp8_h8"),
         pytest.param(16, 4, id="glm53_flash_tp4_h16"),
+        pytest.param(32, 2, id="glm53_flash_tp2_h32"),
     ],
 )
 # Batch 72 takes the 3-stage state staging at H >= 8, on SM90 with streaming at H = 8.
 @pytest.mark.parametrize("batch", [4, _BATCH])
 def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int, batch: int):
-    lower_bound = -5.0 if heads in (8, 16) else None
+    lower_bound = -5.0 if heads in (8, 16, 32) else None
     (
         mixed_qkv,
         a,
@@ -279,7 +280,7 @@ def _load_weights(model, attn, hook: str, seed: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("heads", [8, 16, 32])
 @pytest.mark.parametrize("hook", ["load_weights", "post_load_weights"])
 @pytest.mark.parametrize("device_sm", [80, 90, 100, 120])
 def test_glm5_next_weight_loading_publishes_fused_decode_inputs(

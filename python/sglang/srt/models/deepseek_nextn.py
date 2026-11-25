@@ -66,6 +66,7 @@ class DeepseekModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        preserve_modelopt_fp4: bool = False,
     ) -> None:
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
@@ -77,7 +78,11 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not preserve_modelopt_fp4
+        ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
@@ -328,7 +333,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
-            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+            config,
+            nextn_quant_config,
+            prefix=add_prefix("model", prefix),
+            preserve_modelopt_fp4=getattr(self, "_preserve_modelopt_fp4_nextn", False),
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

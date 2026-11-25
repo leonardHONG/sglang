@@ -729,12 +729,16 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        # Offer the output-norm gate to the fused decode kernel (the same
-        # attempt-and-verify handoff as Kimi-K3); an unconsumed stash means the
-        # backend ran the unfused chain and o_norm is applied here.
+        # Offer the output-norm gate to the fused decode and target-verify
+        # kernels (the same attempt-and-verify handoff as Kimi-K3); an
+        # unconsumed stash means the backend ran the unfused chain and o_norm
+        # is applied here.
         fused_onorm = (
             forward_batch.forward_mode.is_decode()
             and mixed_qkv.shape[0] < self._kda_fused_decode_max_tokens
+        ) or (
+            forward_batch.forward_mode.is_target_verify()
+            and self.attn._k3_fused_decode_args is not None
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
@@ -815,6 +819,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 skip_rope=True,
             )
+            self.self_attn.dsa_decode_absorb_under_indexer = True
 
         if config.q_lora_rank is None and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -848,6 +853,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 reduce_results=False,
                 allow_fused_down=False,
             )
+            self.mlp.enable_nvfp4_swiglu_fusion_if_eligible()
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1688,23 +1694,47 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
 
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp4LinearMethod,
+        )
+
         seen = set()
         for module in self.model.modules():
-            if not isinstance(module, Glm5NextMoE):
-                continue
-            experts = module.experts
-            key = (experts.w13_weight.shape, experts.w2_weight.shape)
-            if key in seen:
-                continue
-            seen.add(key)
-            hidden_states = torch.randn(
-                (num_tokens, module.gate.weight.shape[1]),
-                dtype=dtype,
-                device=experts.w13_weight.device,
-            )
-            router_logits = module.gate(hidden_states)
-            experts(hidden_states, module.topk(hidden_states, router_logits))
-            del hidden_states, router_logits
+            if isinstance(module, Glm5NextMoE):
+                experts = module.experts
+                key = ("moe", experts.w13_weight.shape, experts.w2_weight.shape)
+                if key in seen:
+                    continue
+                seen.add(key)
+                hidden_states = torch.randn(
+                    (num_tokens, module.gate.weight.shape[1]),
+                    dtype=dtype,
+                    device=experts.w13_weight.device,
+                )
+                router_logits = module.gate(hidden_states)
+                experts(hidden_states, module.topk(hidden_states, router_logits))
+                del hidden_states, router_logits
+            elif (
+                isinstance(module, LinearBase)
+                and isinstance(module.quant_method, ModelOptFp4LinearMethod)
+                and not getattr(module, "_accepts_prequantized_fp4", False)
+            ):
+                key = (
+                    "nvfp4_linear",
+                    module.input_size_per_partition,
+                    module.output_size_per_partition,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                hidden_states = torch.randn(
+                    (num_tokens, module.input_size_per_partition),
+                    dtype=dtype,
+                    device=module.weight.device,
+                )
+                module.quant_method.apply(module, hidden_states)
+                del hidden_states
         if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
             return 0
         return len(seen)

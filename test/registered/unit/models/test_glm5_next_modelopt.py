@@ -159,5 +159,60 @@ class TestGlm5NextNextNScaleLoading(CustomTestCase):
                 unused.weight_loader.assert_not_called()
 
 
+class TestGlm5NextNextNModelOptFp4Resolution(CustomTestCase):
+    def test_preserves_modelopt_fp4_when_checkpoint_quantizes_nextn_experts(self):
+        from sglang.srt.models import glm5_next_nextn
+
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["*.self_attn.*", "*.mlp.shared_experts.*", "*.mlp.gate"],
+        )
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(
+                SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=45))
+            )
+        )
+        model = Glm5NextForConditionalGenerationNextN.__new__(
+            Glm5NextForConditionalGenerationNextN
+        )
+        model._root_quantization_config = {"ignore": ["*.self_attn.*"]}
+        model._preserve_modelopt_fp4_nextn = False
+        text_cfg = SimpleNamespace(num_hidden_layers=45)
+
+        with patch.object(
+            glm5_next_nextn, "_checkpoint_has_nvfp4_nextn_experts", return_value=True
+        ):
+            resolved = model._resolve_nextn_quant_config(text_cfg, config)
+        self.assertIs(resolved, config)
+        self.assertTrue(model._preserve_modelopt_fp4_nextn)
+
+    def test_drops_modelopt_fp4_when_nextn_excluded_or_unquantized(self):
+        from sglang.srt.models import glm5_next_nextn
+
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=RADIXARK_EXCLUDE_MODULES,
+        )
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(
+                SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=45))
+            )
+        )
+        model = Glm5NextForConditionalGenerationNextN.__new__(
+            Glm5NextForConditionalGenerationNextN
+        )
+        model._root_quantization_config = {"ignore": RADIXARK_EXCLUDE_MODULES}
+        model._preserve_modelopt_fp4_nextn = False
+        text_cfg = SimpleNamespace(num_hidden_layers=45)
+
+        with patch.object(
+            glm5_next_nextn, "_checkpoint_has_nvfp4_nextn_experts", return_value=True
+        ):
+            model._resolve_nextn_quant_config(text_cfg, config)
+        self.assertFalse(model._preserve_modelopt_fp4_nextn)
+
+
 if __name__ == "__main__":
     unittest.main()

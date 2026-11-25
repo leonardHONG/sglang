@@ -346,6 +346,39 @@ class DeepseekV2MLP(nn.Module):
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
 
+    def enable_nvfp4_swiglu_fusion_if_eligible(self) -> None:
+        """Enable fused NVFP4 gate_up + SwiGLU (+ optional clamp) + FP4 quant when eligible.
+        Must be called before weight loading so process_weights_after_loading builds
+        the [Up, Gate]-interleaved weight + scale."""
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp4LinearMethod,
+        )
+
+        fc1_n = self.gate_up_proj.output_size_per_partition
+        if (
+            get_platform().is_sm100
+            # The fused kernel bypasses the LoRA wrappers.
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+            and isinstance(
+                self.gate_up_proj.quant_method,
+                ModelOptFp4LinearMethod,
+            )
+            and self.gate_up_proj.quant_method.quant_mode == "w4a4"
+            and get_fp4_gemm_runner_backend().supports_swiglu_fusion()
+            and isinstance(
+                self.down_proj.quant_method,
+                ModelOptFp4LinearMethod,
+            )
+            and fc1_n % 128 == 0
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+        ):
+            self.gate_up_proj._interleave_for_swiglu_fusion = True
+            self._enable_nvfp4_gemm_swiglu_fusion = True
+            self.down_proj._accepts_prequantized_fp4 = True
+
     def forward(
         self,
         x,
@@ -358,7 +391,6 @@ class DeepseekV2MLP(nn.Module):
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
-            and self.swiglu_limit is None
             and not isinstance(x, tuple)
         ):
             from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
@@ -377,6 +409,7 @@ class DeepseekV2MLP(nn.Module):
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
                 enable_pdl=True,
+                swiglu_limit=self.swiglu_limit,
             )
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
@@ -914,38 +947,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated" if _shared_expert_use_tp1 else "tp",
             )
-            # Flags must be set before weight load so
-            # process_weights_after_loading sees them and builds the
-            # [Up, Gate]-interleaved weight + scale.
-            from sglang.srt.layers.quantization.fp4_utils import (
-                get_fp4_gemm_runner_backend,
-            )
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                ModelOptFp4LinearMethod,
-            )
-
-            fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
-            if (
-                get_platform().is_sm100
-                # The fused kernel bypasses the LoRA wrappers.
-                and not (get_lora().enable_lora or get_lora().lora_paths)
-                and isinstance(
-                    self.shared_experts.gate_up_proj.quant_method,
-                    ModelOptFp4LinearMethod,
-                )
-                and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
-                and get_fp4_gemm_runner_backend().supports_swiglu_fusion()
-                and isinstance(
-                    self.shared_experts.down_proj.quant_method,
-                    ModelOptFp4LinearMethod,
-                )
-                and fc1_n % 128 == 0
-                and self.shared_experts.swiglu_limit is None
-                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            ):
-                self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
-                self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
-                self.shared_experts.down_proj._accepts_prequantized_fp4 = True
+            self.shared_experts.enable_nvfp4_swiglu_fusion_if_eligible()
             self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = (
                 hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")

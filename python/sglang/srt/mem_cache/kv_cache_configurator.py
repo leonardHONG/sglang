@@ -2578,7 +2578,10 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
-            fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
+            fp8_cast_on_write=(
+                is_kimi_k31(self.model_config.hf_config)
+                or self.model_config.qk_rope_head_dim == 0
+            ),
             use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
@@ -2858,7 +2861,10 @@ class KVCacheConfigurator:
                         self.model_config.hf_config
                     ),
                     kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
-                    fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
+                    fp8_cast_on_write=(
+                        is_kimi_k31(self.model_config.hf_config)
+                        or self.model_config.qk_rope_head_dim == 0
+                    ),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker

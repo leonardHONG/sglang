@@ -164,6 +164,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         use_prefetch: bool = False,
         prefetch_dist: int = 3,
         vectorized_f32: bool = True,
+        swiglu_limit: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel with SwiGLU fusion.
 
@@ -240,6 +241,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.use_prefetch = use_prefetch
         self.prefetch_dist = prefetch_dist
         self.vectorized_f32 = vectorized_f32
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1625,6 +1627,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                     cutlass.Float32(current_alpha_scale),
                                 ),
                             )
+                            if cutlass.const_expr(self.swiglu_limit is not None):
+                                lim = cutlass.Float32(self.swiglu_limit)
+                                acc_vec_gate_alpha = (
+                                    fmin(acc_vec_gate_alpha[0], lim),
+                                    fmin(acc_vec_gate_alpha[1], lim),
+                                )
+                                acc_vec_up_alpha = (
+                                    -fmin(-fmin(acc_vec_up_alpha[0], lim), lim),
+                                    -fmin(-fmin(acc_vec_up_alpha[1], lim), lim),
+                                )
                             tCompute_log2e = cute.arch.mul_packed_f32x2(
                                 (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
                                 (-LOG2_E, -LOG2_E),
@@ -1665,6 +1677,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(
                                 current_alpha_scale
                             )
+                            if cutlass.const_expr(self.swiglu_limit is not None):
+                                lim = cutlass.Float32(self.swiglu_limit)
+                                acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, lim)
+                                acc_vec_up_alpha = -fmin(
+                                    -fmin(acc_vec_up_alpha, lim), lim
+                                )
                             tCompute[i] = acc_vec_up_alpha * silu_f32(
                                 acc_vec_gate_alpha, fastmath=True
                             )
@@ -2743,7 +2761,9 @@ def _get_compiled(
     prefetch_dist: int,
     vectorized_f32: bool,
     enable_pdl: bool,
+    swiglu_limit: Optional[float] = None,
 ):
+    swiglu_limit_key = float(swiglu_limit) if swiglu_limit is not None else None
     cache_key = (
         n,
         k,
@@ -2757,6 +2777,7 @@ def _get_compiled(
         prefetch_dist,
         vectorized_f32,
         enable_pdl,
+        swiglu_limit_key,
     )
     cached = _compiled_kernel_cache.get(cache_key)
     if cached is not None:
@@ -2768,6 +2789,7 @@ def _get_compiled(
         use_prefetch=use_prefetch,
         prefetch_dist=prefetch_dist,
         vectorized_f32=vectorized_f32,
+        swiglu_limit=swiglu_limit_key,
     )
     compiled = cute.compile(
         gemm.wrapper,
@@ -2810,6 +2832,7 @@ def nvfp4_gemm_swiglu_nvfp4_quant(
     prefetch_dist: int = 3,
     vectorized_f32: bool = True,
     enable_pdl: bool = False,
+    swiglu_limit: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """NVFP4 GEMM fused with SwiGLU and NVFP4 output quantization.
 
@@ -2958,6 +2981,7 @@ def nvfp4_gemm_swiglu_nvfp4_quant(
         prefetch_dist=prefetch_dist,
         vectorized_f32=vectorized_f32,
         enable_pdl=bool(enable_pdl),
+        swiglu_limit=swiglu_limit,
     )
 
     compiled_gemm(
