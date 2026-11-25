@@ -32,6 +32,80 @@ _SM90_PLUS_FP8_CONFIGS = [
     (1024, (32, 4, 2)),
     (float("inf"), (16, 1, 3)),
 ]
+# SM90+ FP8 int16-pair PTX kernel: 64-token tiles with 4 warps and deep
+# cp.async pipeline hide scattered FP8 HBM gather latency on Hopper/Blackwell.
+_SM90_PLUS_FP8_PAIRS_CONFIGS = [
+    (64, (32, 4, 2)),
+    (1024, (32, 4, 3)),
+    (float("inf"), (64, 4, 5)),
+]
+
+
+@functools.lru_cache(maxsize=1)
+def _supports_fp8_pairs_ptx() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(0) >= (9, 0)
+    )
+
+
+def _get_fp8_pairs_config(total_q: int):
+    return next(cfg for limit, cfg in _SM90_PLUS_FP8_PAIRS_CONFIGS if total_q <= limit)
+
+
+def _normalize_output_gate(
+    output_gate: Optional[torch.Tensor],
+    total_q: int,
+    num_q_heads: int,
+    head_dim: int,
+) -> Optional[torch.Tensor]:
+    if output_gate is None:
+        return None
+    gate = output_gate[:total_q]
+    if gate.ndim == 2:
+        gate = gate.view(total_q, num_q_heads, head_dim)
+    return gate
+
+
+@triton.jit
+def _e4m3_pairs_to_fp16(pairs, HIGH: tl.constexpr):
+    """Unpack one byte (byte 0 = dim 2i, byte 1 = dim 2i+1) of each int16 pair
+    of FP8-E4M3 codes into FP16 using pack=2 inline PTX (4 bytes/insn)."""
+    if HIGH:
+        return tl.inline_asm_elementwise(
+            asm="""
+            {
+                .reg .b32 t;
+                .reg .b16 lo, hi;
+                prmt.b32 t, $1, 0, 0x3120;
+                mov.b32 {lo, hi}, t;
+                cvt.rn.f16x2.e4m3x2 $0, hi;
+            }
+            """,
+            constraints="=r,r",
+            args=[pairs],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            asm="""
+            {
+                .reg .b32 t;
+                .reg .b16 lo, hi;
+                prmt.b32 t, $1, 0, 0x3120;
+                mov.b32 {lo, hi}, t;
+                cvt.rn.f16x2.e4m3x2 $0, lo;
+            }
+            """,
+            constraints="=r,r",
+            args=[pairs],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
 
 
 @functools.lru_cache(maxsize=2)
@@ -63,6 +137,7 @@ def _sparse_gqa_prefill(
     k,
     v,
     out,
+    gate,
     indices,
     cu_seqlens,
     scale,
@@ -79,6 +154,9 @@ def _sparse_gqa_prefill(
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
+    sg_m: tl.constexpr,
+    sg_h: tl.constexpr,
+    sg_d: tl.constexpr,
     si_m: tl.constexpr,
     si_g: tl.constexpr,
     si_n: tl.constexpr,
@@ -87,6 +165,7 @@ def _sparse_gqa_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HAS_GATE: tl.constexpr,
 ):
     batch_group = tl.program_id(1)
     group = batch_group % NUM_KV_HEADS
@@ -143,6 +222,16 @@ def _sparse_gqa_prefill(
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
     output = accumulator / normalizer[:, None]
+    if HAS_GATE:
+        g_vals = tl.load(
+            gate
+            + query * sg_m
+            + (head_start + offs_h[:, None]) * sg_h
+            + offs_d[None, :] * sg_d,
+            mask=(offs_h < GROUP_SIZE)[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        output = output * tl.sigmoid(g_vals)
     tl.store(
         out
         + query * so_m
@@ -153,18 +242,34 @@ def _sparse_gqa_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, scale):
+def sparse_gqa_fwd_interface_triton(
+    q,
+    k,
+    v,
+    max_seqlen_k,
+    indices,
+    cu_seqlens,
+    scale,
+    *,
+    out: Optional[torch.Tensor] = None,
+    output_gate: Optional[torch.Tensor] = None,
+):
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q, is_fp8=k.element_size() == 1)
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
+    gate_3d = _normalize_output_gate(output_gate, total_q, num_q_heads, head_dim)
+    has_gate = gate_3d is not None
+    gate_arg = gate_3d if has_gate else q
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,
         k,
         v,
         out,
+        gate_arg,
         indices,
         cu_seqlens,
         scale,
@@ -181,6 +286,9 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        gate_arg.stride(0) if has_gate else 0,
+        gate_arg.stride(1) if has_gate else 0,
+        gate_arg.stride(2) if has_gate else 0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -189,6 +297,7 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        HAS_GATE=has_gate,
         num_warps=warps,
         num_stages=stages,
     )
@@ -201,6 +310,7 @@ def _sparse_gqa_chunk_prefill(
     k,
     v,
     out,
+    gate,
     indices,
     cu_q,
     cu_k,
@@ -219,6 +329,9 @@ def _sparse_gqa_chunk_prefill(
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
+    sg_m: tl.constexpr,
+    sg_h: tl.constexpr,
+    sg_d: tl.constexpr,
     si_m: tl.constexpr,
     si_g: tl.constexpr,
     si_n: tl.constexpr,
@@ -228,6 +341,7 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     SLOT_INDICES: tl.constexpr,
+    HAS_GATE: tl.constexpr,
 ):
     """One query row x one KV head group over its ``topk`` selected tokens.
 
@@ -300,6 +414,16 @@ def _sparse_gqa_chunk_prefill(
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
     output = accumulator / normalizer[:, None]
+    if HAS_GATE:
+        g_vals = tl.load(
+            gate
+            + query * sg_m
+            + (group * GROUP_SIZE + offs_h[:, None]) * sg_h
+            + offs_d[None, :] * sg_d,
+            mask=(offs_h < GROUP_SIZE)[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        output = output * tl.sigmoid(g_vals)
     tl.store(
         out
         + query * so_m
@@ -307,6 +431,170 @@ def _sparse_gqa_chunk_prefill(
         + offs_d[None, :] * so_d,
         output,
         mask=(offs_h < GROUP_SIZE)[:, None],
+    )
+
+
+@triton.jit
+def _sparse_gqa_chunk_prefill_fp8_pairs(
+    q,
+    k_pairs_ptr,
+    v_pairs_ptr,
+    out,
+    gate,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    topk,
+    sq_m: tl.constexpr,
+    sq_h: tl.constexpr,
+    sq_d: tl.constexpr,
+    sk_n: tl.constexpr,
+    sk_h: tl.constexpr,
+    sk_d: tl.constexpr,
+    sv_n: tl.constexpr,
+    sv_h: tl.constexpr,
+    sv_d: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    sg_m: tl.constexpr,
+    sg_h: tl.constexpr,
+    sg_d: tl.constexpr,
+    si_m: tl.constexpr,
+    si_g: tl.constexpr,
+    si_n: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HALF_DIM: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    SLOT_INDICES: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    ALIGNED_8: tl.constexpr,
+):
+    """SM90+ FP8-E4M3 sparse prefill using 16B-aligned int16-pair loads,
+    pack=2 inline PTX cvt.rn.f16x2.e4m3x2 unpacking, and pipelined K/V gathers."""
+    query_relative = tl.program_id(0).to(tl.int64)
+    batch_group = tl.program_id(1)
+    group = batch_group % NUM_KV_HEADS
+    batch = batch_group // NUM_KV_HEADS
+    q_start = tl.load(cu_q + batch)
+    q_end = tl.load(cu_q + batch + 1)
+    query = (q_start + query_relative).to(tl.int64)
+    if query >= q_end:
+        return
+    if SLOT_INDICES:
+        k_start = 0
+    else:
+        k_start = tl.load(cu_k + batch).to(tl.int64)
+    kv_len = tl.load(kv_lens + batch).to(tl.int64)
+    visible = query_relative + kv_len - (q_end - q_start) + 1
+    row_topk = tl.minimum(topk, visible)
+    num_tiles = tl.cdiv(row_topk, BLOCK_N)
+
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_half_d = tl.arange(0, HALF_DIM)
+    head_start = group * GROUP_SIZE
+    head_mask = (offs_h < GROUP_SIZE)[:, None]
+
+    q_pair_base = (
+        q
+        + query * sq_m
+        + (head_start + offs_h[:, None]) * sq_h
+        + (2 * offs_half_d[None, :]) * sq_d
+    )
+    q_even = tl.load(q_pair_base, mask=head_mask, other=0.0)
+    q_odd = tl.load(q_pair_base + sq_d, mask=head_mask, other=0.0)
+    q_dtype = q_even.dtype
+    score_scale = scale * 1.4426950408889634
+
+    k_base = k_pairs_ptr + k_start * sk_n + group * sk_h
+    v_base = v_pairs_ptr + k_start * sv_n + group * sv_h
+    idx_row = indices + query * si_m + group * si_g
+
+    max_value = tl.full([BLOCK_M], -1.0e20, tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    acc_even = tl.zeros([BLOCK_M, HALF_DIM], tl.float32)
+    acc_odd = tl.zeros([BLOCK_M, HALF_DIM], tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    for tile in tl.range(0, num_tiles, num_stages=NUM_STAGES):
+        current = tile * BLOCK_N + offs_n
+        token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
+        valid = token >= 0
+        safe_token = tl.maximum(token, 0).to(tl.int64)
+
+        k_tok_off = safe_token * sk_n
+        v_tok_off = safe_token * sv_n
+        if ALIGNED_8:
+            k_tok_off = tl.multiple_of(k_tok_off, 8)
+            v_tok_off = tl.multiple_of(v_tok_off, 8)
+        key_pairs = tl.trans(
+            tl.load(
+                k_base + k_tok_off[:, None] + offs_half_d[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+        )
+        value_pairs = tl.load(
+            v_base + v_tok_off[:, None] + offs_half_d[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+
+        scores = tl.dot(
+            q_even, _e4m3_pairs_to_fp16(key_pairs, False).to(q_dtype)
+        ) + tl.dot(q_odd, _e4m3_pairs_to_fp16(key_pairs, True).to(q_dtype))
+        scores *= score_scale
+        scores = tl.where(valid[None, :], scores, -1.0e20)
+
+        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
+        probs_fp16 = probabilities.to(tl.float16)
+
+        acc_even = tl.dot(
+            probs_fp16,
+            _e4m3_pairs_to_fp16(value_pairs, False),
+            acc=acc_even * alpha[:, None],
+        )
+        acc_odd = tl.dot(
+            probs_fp16,
+            _e4m3_pairs_to_fp16(value_pairs, True),
+            acc=acc_odd * alpha[:, None],
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        max_value = next_max
+
+    has_values = normalizer > 0
+    inv_norm = 1.0 / tl.maximum(normalizer, 1.0e-20)
+    out_even = tl.where(has_values[:, None], acc_even * inv_norm[:, None], 0.0)
+    out_odd = tl.where(has_values[:, None], acc_odd * inv_norm[:, None], 0.0)
+    output = tl.interleave(out_even, out_odd)
+    if HAS_GATE:
+        g_vals = tl.load(
+            gate
+            + query * sg_m
+            + (head_start + offs_h[:, None]) * sg_h
+            + offs_d[None, :] * sg_d,
+            mask=head_mask,
+            other=0.0,
+        ).to(tl.float32)
+        output = output * tl.sigmoid(g_vals)
+    tl.store(
+        out
+        + query * so_m
+        + (head_start + offs_h[:, None]) * so_h
+        + offs_d[None, :] * so_d,
+        output.to(out.dtype.element_ty),
+        mask=head_mask,
     )
 
 
@@ -410,8 +698,56 @@ def pack_qsa_prefill_kv(
     return packed_k, packed_v
 
 
+def _can_use_fp8_pairs(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[bool, bool, bool]:
+    """Returns (use_fp8_pairs_kernel, packed_int16_pairs, aligned_8)."""
+    head_dim = q.shape[2]
+    if not (
+        _supports_fp8_pairs_ptx()
+        and k.dtype == torch.float8_e4m3fn
+        and v.dtype == torch.float8_e4m3fn
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and head_dim >= 32
+        and head_dim % 4 == 0
+        and not is_batch_invariant_mode_enabled()
+    ):
+        return False, False, False
+    packed = (
+        k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and k.stride(0) % 2 == 0
+        and k.stride(1) % 2 == 0
+        and v.stride(0) % 2 == 0
+        and v.stride(1) % 2 == 0
+        and k.storage_offset() % 2 == 0
+        and v.storage_offset() % 2 == 0
+    )
+    aligned_8 = (
+        packed
+        and k.stride(0) % 16 == 0
+        and k.stride(1) % 16 == 0
+        and v.stride(0) % 16 == 0
+        and v.stride(1) % 16 == 0
+        and k.data_ptr() % 16 == 0
+        and v.data_ptr() % 16 == 0
+    )
+    return True, packed, aligned_8
+
+
 def sparse_gqa_fwd_interface_triton_ck(
-    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q: Optional[int] = None
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    max_q: Optional[int] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+    output_gate: Optional[torch.Tensor] = None,
 ):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
@@ -421,13 +757,70 @@ def sparse_gqa_fwd_interface_triton_ck(
         # Host sync; callers that know the longest entry pass it instead.
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
+    if out is None:
+        out = torch.empty_like(q)
+    gate_3d = _normalize_output_gate(output_gate, total_q, num_q_heads, head_dim)
+    has_gate = gate_3d is not None
+    gate_arg = gate_3d if has_gate else q
+    use_fp8_pairs, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k, v)
+    if use_fp8_pairs:
+        if not packed_pairs:
+            k, v = k.contiguous(), v.contiguous()
+            _, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k, v)
+        k_arg = k.view(torch.int16)
+        v_arg = v.view(torch.int16)
+        block_n, warps, stages = _get_fp8_pairs_config(total_q)
+        _sparse_gqa_chunk_prefill_fp8_pairs[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
+            q,
+            k_arg,
+            v_arg,
+            out,
+            gate_arg,
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            scale,
+            indices.shape[-1],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_arg.stride(0),
+            k_arg.stride(1),
+            k_arg.stride(2),
+            v_arg.stride(0),
+            v_arg.stride(1),
+            v_arg.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            gate_arg.stride(0) if has_gate else 0,
+            gate_arg.stride(1) if has_gate else 0,
+            gate_arg.stride(2) if has_gate else 0,
+            indices.stride(0),
+            indices.stride(1) if indices.ndim == 3 else 0,
+            indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+            NUM_KV_HEADS=num_kv_heads,
+            GROUP_SIZE=group_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            HALF_DIM=head_dim // 2,
+            NUM_STAGES=stages,
+            SLOT_INDICES=False,
+            HAS_GATE=has_gate,
+            ALIGNED_8=aligned_8,
+            num_warps=warps,
+            num_stages=stages,
+        )
+        return out
     block_n, warps, stages = _get_best_config(total_q, is_fp8=k.element_size() == 1)
-    out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
         k,
         v,
         out,
+        gate_arg,
         indices,
         cu_q,
         cu_k,
@@ -446,6 +839,9 @@ def sparse_gqa_fwd_interface_triton_ck(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        gate_arg.stride(0) if has_gate else 0,
+        gate_arg.stride(1) if has_gate else 0,
+        gate_arg.stride(2) if has_gate else 0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -455,6 +851,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=False,
+        HAS_GATE=has_gate,
         num_warps=warps,
         num_stages=stages,
     )
@@ -481,6 +878,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         k,
         v,
         out,
+        q,
         indices,
         cu_q,
         cu_k,
@@ -499,6 +897,9 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        0,
+        0,
+        0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -508,6 +909,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=False,
+        HAS_GATE=False,
         num_warps=warps,
         num_stages=stages,
     )
@@ -544,7 +946,18 @@ def _resolve_prefill_slots(
 
 
 def sparse_gqa_paged_prefill_triton(
-    q, k_cache, v_cache, slot_table, indices, cu_q, kv_lens, scale, *, max_q
+    q,
+    k_cache,
+    v_cache,
+    slot_table,
+    indices,
+    cu_q,
+    kv_lens,
+    scale,
+    *,
+    max_q,
+    out: Optional[torch.Tensor] = None,
+    output_gate: Optional[torch.Tensor] = None,
 ):
     """Chunk-prefill sparse attention that reads K/V in place from the KV pool.
 
@@ -565,7 +978,8 @@ def sparse_gqa_paged_prefill_triton(
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
     num_entries = cu_q.shape[0] - 1
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
     if total_q == 0 or num_entries == 0:
         return out
     indices = indices[:total_q]
@@ -587,6 +1001,65 @@ def sparse_gqa_paged_prefill_triton(
         num_warps=4,
     )
     block_m = max(16, triton.next_power_of_2(group_size))
+    gate_3d = _normalize_output_gate(output_gate, total_q, num_q_heads, head_dim)
+    has_gate = gate_3d is not None
+    gate_arg = gate_3d if has_gate else q
+
+    use_fp8_pairs, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k_cache, v_cache)
+    if use_fp8_pairs:
+        if not packed_pairs:
+            # Non-unit inner stride (e.g., synthetic strided test views); production
+            # KV pools are always contiguous along head_dim so this copy is skipped.
+            k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
+            _, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k_cache, v_cache)
+        k_arg = k_cache.view(torch.int16)
+        v_arg = v_cache.view(torch.int16)
+        block_n, warps, stages = _get_fp8_pairs_config(total_q)
+        _sparse_gqa_chunk_prefill_fp8_pairs[(max_q, num_entries * num_kv_heads)](
+            q,
+            k_arg,
+            v_arg,
+            out,
+            gate_arg,
+            slots,
+            cu_q,
+            cu_q,
+            kv_lens,
+            scale,
+            topk,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_arg.stride(0),
+            k_arg.stride(1),
+            k_arg.stride(2),
+            v_arg.stride(0),
+            v_arg.stride(1),
+            v_arg.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            gate_arg.stride(0) if has_gate else 0,
+            gate_arg.stride(1) if has_gate else 0,
+            gate_arg.stride(2) if has_gate else 0,
+            slots.stride(0),
+            0,
+            slots.stride(1),
+            NUM_KV_HEADS=num_kv_heads,
+            GROUP_SIZE=group_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            HALF_DIM=head_dim // 2,
+            NUM_STAGES=stages,
+            SLOT_INDICES=True,
+            HAS_GATE=has_gate,
+            ALIGNED_8=aligned_8,
+            num_warps=warps,
+            num_stages=stages,
+        )
+        return out
+
     block_n, warps, stages = _get_best_config(
         total_q, is_fp8=k_cache.element_size() == 1
     )
@@ -595,6 +1068,7 @@ def sparse_gqa_paged_prefill_triton(
         k_cache,
         v_cache,
         out,
+        gate_arg,
         slots,
         cu_q,
         cu_q,
@@ -613,6 +1087,9 @@ def sparse_gqa_paged_prefill_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        gate_arg.stride(0) if has_gate else 0,
+        gate_arg.stride(1) if has_gate else 0,
+        gate_arg.stride(2) if has_gate else 0,
         slots.stride(0),
         0,
         slots.stride(1),
@@ -622,6 +1099,7 @@ def sparse_gqa_paged_prefill_triton(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=True,
+        HAS_GATE=has_gate,
         num_warps=warps,
         num_stages=stages,
     )

@@ -129,10 +129,20 @@ def can_fuse_qwen4_gate_reduce(key, query, value):
     )
 
 
-def fused_qwen4_gate_reduce(key, query, value):
+def fused_qwen4_gate_reduce(key, query, value, *, out=None):
     if not can_fuse_qwen4_gate_reduce(key, query, value):
         raise ValueError("unsupported input for Qwen4 PLE gate reduction")
-    output = torch.empty_like(key)
+    if out is None:
+        output = torch.empty_like(key)
+    else:
+        if (
+            out.shape != key.shape
+            or out.dtype != key.dtype
+            or out.device != key.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("invalid out tensor for Qwen4 PLE gate reduction")
+        output = out
     if key.shape[0]:
         _qwen4_gate_reduce_kernel[(key.shape[0] * _QWEN4_HC_COUNT,)](
             key,

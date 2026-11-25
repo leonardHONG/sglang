@@ -40,6 +40,15 @@ for _fn in ("hc_combine_logits", "hc_combine_logits_norm"):
     )
 del _fn
 
+register_kernel(
+    KernelSpec(
+        op="elementwise.hc_mix_up_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.hc_mix:hc_mix_up_gate",
+        capabilities=CUDA_ONLY,
+    )
+)
+
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(

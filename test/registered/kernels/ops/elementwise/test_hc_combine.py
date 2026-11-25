@@ -200,6 +200,45 @@ def test_hc_combine_logits_and_norm_correctness(dtype, num_tokens, strided_logit
     torch.testing.assert_close(normalized, ref_norm, **norm_tol)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("lowrank", [16, 320])
+@pytest.mark.parametrize("num_tokens", [0, 1, 7, 48, 65, 257, 8243])
+@pytest.mark.parametrize("padded_down", [False, True])
+@pytest.mark.parametrize("fuse_silu", [False, True])
+def test_hc_mix_up_gate_correctness(dtype, lowrank, num_tokens, padded_down, fuse_silu):
+    from sglang.kernels.ops.elementwise.hc_mix import hc_mix_up_gate
+
+    torch.manual_seed(7)
+    x = torch.randn(num_tokens, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda")
+    w_up = (
+        torch.randn(HC_COUNT * HIDDEN_SIZE, lowrank, dtype=dtype, device="cuda")
+        * (0.1 / (lowrank / 16) ** 0.5)
+    )
+    if padded_down:
+        total = lowrank + HC_COUNT
+        down_cols = total + ((-total) % 16)
+    else:
+        down_cols = lowrank
+    down_proj = torch.randn(num_tokens, down_cols, dtype=dtype, device="cuda")
+
+    out = hc_mix_up_gate(
+        x, down_proj, w_up, HC_COUNT, HIDDEN_SIZE, lowrank, fuse_silu=fuse_silu
+    )
+    assert out.shape == (num_tokens, HIDDEN_SIZE)
+    assert out.dtype == dtype
+    if num_tokens == 0:
+        return
+
+    t = F.silu(down_proj[:, :lowrank].float() / HC_COUNT).to(dtype)
+    gates = torch.sigmoid(F.linear(t.float(), w_up.float()).to(dtype).float()).unflatten(
+        -1, (HC_COUNT, HIDDEN_SIZE)
+    )
+    ref = (
+        (gates * x.float().unflatten(-1, (HC_COUNT, HIDDEN_SIZE))).mean(dim=-2).to(dtype)
+    )
+    torch.testing.assert_close(out, ref, **_TOLERANCES[dtype])
+
+
 if __name__ == "__main__":
     import sys
 

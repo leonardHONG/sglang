@@ -1126,6 +1126,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_prefill_graph_max_tokens=_prefill_graph_max_tokens(
                 self.target_worker.model_runner.prefill_cuda_graph_runner
             ),
+            is_qsa_mtp=self._split_prefill_is_qsa_mtp,
         ):
             return self._draft_extend_for_prefill_split(
                 batch,
@@ -1172,35 +1173,46 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _can_split_prefill_draft_extend(self) -> bool:
+        self._split_prefill_is_qsa_mtp = False
         if not _is_cuda:
             return False
         from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 
         model = self.draft_runner.model
         kv_cache_dtype = self.draft_runner.kv_cache_dtype
-        return (
-            isinstance(model, DeepseekV3ForCausalLMNextN)
-            and model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype)
+        is_deepseek_nextn = isinstance(model, DeepseekV3ForCausalLMNextN)
+        is_qwen4_mtp = isinstance(model, Qwen4ExpForCausalLMMTP)
+        if not (is_deepseek_nextn or is_qwen4_mtp):
+            return False
+        if not model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype):
+            return False
+        if (
+            is_deepseek_nextn
             # With an FP8 cache and no prefix, these DSA prefills read fresh KV,
             # while the last-token pass reads the cache; flashmla_auto may pick one.
-            and not (
-                kv_cache_dtype == torch.float8_e4m3fn
-                and get_exec().kernel.dsa_prefill_backend
-                in (
-                    "flashmla_sparse",
-                    "flashmla_sparse_q8",
-                    "triton_sparse_mla",
-                    "flashmla_auto",
-                )
+            and kv_cache_dtype == torch.float8_e4m3fn
+            and get_exec().kernel.dsa_prefill_backend
+            in (
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "triton_sparse_mla",
+                "flashmla_auto",
             )
-            and not get_parallel().attn_dp_enabled
-            and not get_parallel().enable_prefill_cp
+        ):
+            return False
+        if (
+            get_parallel().attn_dp_enabled
+            or get_parallel().enable_prefill_cp
             # The split is not validated with decode context parallel's KV layout.
-            and not get_parallel().dcp_enabled
+            or get_parallel().dcp_enabled
             # The indexer top-k capturer copies the top-k rows per forward; the KV-only
             # pass computes none. Read the flag: this runs before the capturer exists.
-            and not get_exec().features.enable_return_indexer_topk
-        )
+            or get_exec().features.enable_return_indexer_topk
+        ):
+            return False
+        self._split_prefill_is_qsa_mtp = is_qwen4_mtp
+        return True
 
     def _draft_extend_for_prefill_split(
         self,

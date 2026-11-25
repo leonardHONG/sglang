@@ -12,14 +12,15 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
-from sglang.srt.models.qwen4_exp import Qwen4ExpModel
+from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer, Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,43 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         assert hc_hidden_states.shape[-1] == self.hc_count * self.hidden_size
         logits_output.hidden_states = hc_hidden_states
 
+    def supports_forward_kv_only(self, *, kv_cache_dtype: torch.dtype) -> bool:
+        del kv_cache_dtype
+        if len(self.model.layers) != 1 or not self.model.pp_group.is_first_rank:
+            return False
+        layer = self.model.layers[0]
+        return (
+            isinstance(layer, Qwen4ExpAttentionDecoderLayer)
+            and layer.is_qsa
+            and layer.ple is None
+            and not get_parallel().enable_layernorm_sp
+        )
+
+    @torch.no_grad()
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        """Write draft KV and QSA indexer state for prefix tokens (L-1); no logits."""
+        with self._npu_quant_context():
+            assert input_embeds is None
+            input_embeds = forward_batch.mm_input_embeds
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
+            hidden_states = forward_batch.spec_info.hidden_states
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
+                self.model.forward_kv_only(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        return LogitsProcessorOutput(next_token_logits=None)
+
     @torch.no_grad()
     def forward(
         self,
@@ -197,6 +235,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        spec_info = forward_batch.spec_info
+        if isinstance(spec_info, EagleDraftExtendInput) and spec_info.kv_only:
+            return self.forward_kv_only(
+                input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
         with self._npu_quant_context():
             input_embeds = self._prepare_input_embeds(
                 input_ids, forward_batch, input_embeds

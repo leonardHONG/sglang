@@ -305,6 +305,7 @@ def fused_qwen4_varlen_conv(
     *,
     track_indices=None,
     track_offsets=None,
+    out=None,
 ):
     """Compute packed PLE convolution and update main/radix state slots.
 
@@ -350,7 +351,17 @@ def fused_qwen4_varlen_conv(
     ):
         raise ValueError("invalid Qwen4 packed-varlen track metadata")
 
-    output = torch.empty_like(x)
+    if out is None:
+        output = torch.empty_like(x)
+    else:
+        if (
+            out.shape != x.shape
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("invalid out tensor for Qwen4 packed-varlen convolution")
+        output = out
     block_channels = 128
     if x.shape[0]:
         _qwen4_varlen_conv_kernel[

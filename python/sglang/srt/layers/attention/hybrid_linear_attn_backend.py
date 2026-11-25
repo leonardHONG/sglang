@@ -10,6 +10,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    copy_indexed_ssm_rows,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
@@ -1155,15 +1156,27 @@ class MambaAttnBackendBase(AttentionBackend):
             # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 if h_track_buf is not None:
-                    ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
-                        forward_metadata.track_ssm_h_batch_src
-                    ].to(ssm_states.dtype, copy=False)
+                    if not copy_indexed_ssm_rows(
+                        h_track_buf,
+                        forward_metadata.track_ssm_h_batch_src,
+                        ssm_states,
+                        forward_metadata.track_ssm_h_dst,
+                    ):
+                        ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
+                            forward_metadata.track_ssm_h_batch_src
+                        ].to(ssm_states.dtype, copy=False)
                 else:
                     assert h is not None
                     h = h.squeeze(0)
-                    ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                        forward_metadata.track_ssm_h_src
-                    ].to(ssm_states.dtype, copy=False)
+                    if not copy_indexed_ssm_rows(
+                        h,
+                        forward_metadata.track_ssm_h_src,
+                        ssm_states,
+                        forward_metadata.track_ssm_h_dst,
+                    ):
+                        ssm_states[forward_metadata.track_ssm_h_dst] = h[
+                            forward_metadata.track_ssm_h_src
+                        ].to(ssm_states.dtype, copy=False)
             if (
                 forward_metadata.track_ssm_recompute_dst is not None
                 and forward_metadata.track_ssm_recompute_dst.numel() > 0
@@ -1173,9 +1186,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     track_states.squeeze(0).to(ssm_states.dtype, copy=False)
                 )
             if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
+                if not copy_indexed_ssm_rows(
+                    ssm_states,
+                    forward_metadata.track_ssm_final_src,
+                    ssm_states,
+                    forward_metadata.track_ssm_final_dst,
+                ):
+                    ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
+                        forward_metadata.track_ssm_final_src
+                    ]
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):

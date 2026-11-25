@@ -148,12 +148,21 @@ def maybe_build_flashinfer_checkpoint_plan(
     )
     assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
 
-    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
-        device, non_blocking=True
+    # Pack both small int64 arrays into a single pinned HtoD transfer to avoid
+    # two blocking pageable HtoD copies in the pre-embedding critical path.
+    n_src = track_checkpoint_src.numel()
+    n_cu = checkpoint_cu_starts.numel()
+    packed_cpu = torch.empty(
+        n_src + n_cu,
+        dtype=torch.int64,
+        pin_memory=(str(device).startswith("cuda") and torch.cuda.is_available()),
     )
-    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
-        device, non_blocking=True
-    )
+    if n_src > 0:
+        packed_cpu[:n_src].copy_(track_checkpoint_src)
+    packed_cpu[n_src:].copy_(checkpoint_cu_starts)
+    packed_dev = packed_cpu.to(device, non_blocking=True)
+    forward_metadata.track_ssm_h_src = packed_dev[:n_src]
+    forward_metadata.state_checkpoint_cu_starts = packed_dev[n_src:]
     forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
     forward_metadata.state_checkpoint_every_n_tokens = effective_stride
 

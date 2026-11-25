@@ -963,3 +963,156 @@ def track_mamba_states_all_layers(
         ssm_states_pool[0, 0].numel(),
         check_freed_slots,
     )
+
+
+@triton.jit(do_not_specialize=["row_elems", "src_row_stride", "dst_row_stride"])
+def _copy_indexed_ssm_rows_kernel(
+    src_ptr,
+    dst_ptr,
+    src_idx_ptr,
+    dst_idx_ptr,
+    row_elems,
+    src_row_stride,
+    dst_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req = tl.program_id(0)
+    tile = tl.program_id(1)
+    s_row = tl.load(src_idx_ptr + req).to(tl.int64)
+    d_row = tl.load(dst_idx_ptr + req).to(tl.int64)
+    offs = tile.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < row_elems
+    vals = tl.load(src_ptr + s_row * src_row_stride + offs, mask=mask)
+    tl.store(
+        dst_ptr + d_row * dst_row_stride + offs,
+        vals.to(dst_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def copy_indexed_ssm_rows(
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst: torch.Tensor,
+    dst_indices: torch.Tensor,
+) -> bool:
+    """Copy ``src[src_indices[i]]`` into ``dst[dst_indices[i]]`` in one Triton
+    launch without allocating an intermediate gathered tensor. Returns True if
+    handled, False if caller should fall back to PyTorch indexing."""
+    num_rows = dst_indices.numel()
+    if num_rows == 0:
+        return True
+    if (
+        not (src.is_cuda and dst.is_cuda)
+        or src.ndim < 2
+        or dst.ndim != src.ndim
+        or src.shape[1:] != dst.shape[1:]
+        or src_indices.numel() != num_rows
+        or not src[0].is_contiguous()
+        or not dst[0].is_contiguous()
+    ):
+        return False
+    row_elems = src[0].numel()
+    block = 2048
+    grid = (num_rows, triton.cdiv(row_elems, block))
+    _copy_indexed_ssm_rows_kernel[grid](
+        src,
+        dst,
+        src_indices.contiguous(),
+        dst_indices.contiguous(),
+        row_elems,
+        src.stride(0),
+        dst.stride(0),
+        BLOCK_SIZE=block,
+        num_warps=8,
+    )
+    return True
+
+
+@triton.jit(
+    do_not_specialize=[
+        "qkv_dim",
+        "src_t_stride",
+        "src_d_stride",
+        "dst_slot_stride",
+        "dst_d_stride",
+        "dst_w_stride",
+    ]
+)
+def _scatter_conv_track_rows_kernel(
+    mixed_qkv_ptr,
+    conv_states_ptr,
+    track_conv_indices_ptr,
+    dst_slot_indices_ptr,
+    qkv_dim,
+    src_t_stride,
+    src_d_stride,
+    dst_slot_stride,
+    dst_d_stride,
+    dst_w_stride,
+    CONV_LEN: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    req = tl.program_id(0)
+    d_tile = tl.program_id(1)
+    dst_slot = tl.load(dst_slot_indices_ptr + req).to(tl.int64)
+    d_offs = d_tile.to(tl.int64) * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < qkv_dim
+    dst_base = conv_states_ptr + dst_slot * dst_slot_stride + d_offs * dst_d_stride
+    idx_base = track_conv_indices_ptr + req.to(tl.int64) * CONV_LEN
+    for w in tl.static_range(CONV_LEN):
+        tok_idx = tl.load(idx_base + w).to(tl.int64)
+        vals = tl.load(
+            mixed_qkv_ptr + tok_idx * src_t_stride + d_offs * src_d_stride,
+            mask=d_mask,
+        )
+        tl.store(
+            dst_base + w * dst_w_stride,
+            vals.to(conv_states_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+
+
+def scatter_conv_track_rows(
+    mixed_qkv: torch.Tensor,
+    track_conv_indices: torch.Tensor,
+    conv_states: torch.Tensor,
+    dst_slot_indices: torch.Tensor,
+) -> bool:
+    """Fused ``conv_states[dst_slot_indices] = mixed_qkv[track_conv_indices].transpose(1, 2)``
+    in one Triton launch with zero intermediate allocation."""
+    num_rows = dst_slot_indices.numel()
+    if num_rows == 0:
+        return True
+    if (
+        not (mixed_qkv.is_cuda and conv_states.is_cuda)
+        or mixed_qkv.ndim != 2
+        or conv_states.ndim != 3
+        or track_conv_indices.ndim != 2
+        or track_conv_indices.shape[0] != num_rows
+        or track_conv_indices.shape[1] != conv_states.shape[2]
+        or mixed_qkv.shape[1] != conv_states.shape[1]
+    ):
+        return False
+    conv_len = conv_states.shape[2]
+    if conv_len <= 0 or conv_len > 16:
+        return False
+    qkv_dim = mixed_qkv.shape[1]
+    block_d = 512
+    grid = (num_rows, triton.cdiv(qkv_dim, block_d))
+    _scatter_conv_track_rows_kernel[grid](
+        mixed_qkv,
+        conv_states,
+        track_conv_indices.contiguous(),
+        dst_slot_indices.contiguous(),
+        qkv_dim,
+        mixed_qkv.stride(0),
+        mixed_qkv.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        CONV_LEN=conv_len,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return True

@@ -19,9 +19,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    can_use_triton_qsa_mqa_paged_prefill,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
+    triton_qsa_mqa_paged_prefill,
 )
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
@@ -597,6 +599,81 @@ class QSAIndexer(MultiPlatformOp):
             del logits, block_indices, selected
         return output
 
+    def select_prefill_tokens_paged(
+        self,
+        q: torch.Tensor,
+        compressed_buffer: torch.Tensor,
+        token_slot_table: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
+        row_lengths: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths_for_rows: torch.Tensor,
+        max_row_keys: int,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Top-k selection scoring directly against the paged compressed-K pool."""
+        rows = q.shape[0]
+        final_topk = self.token_topk + self.compress_ratio - 1
+        if rows == 0:
+            if out is not None:
+                return out[:0]
+            return torch.empty((0, final_topk), dtype=torch.int32, device=q.device)
+
+        use_fast_topk = (
+            self.block_topk == 512 and not is_batch_invariant_mode_enabled()
+        )
+        row_chunk_size = _qsa_prefill_row_chunk_size(rows, max_row_keys, q.shape[1])
+        single_chunk = row_chunk_size >= rows
+        output = out
+        if output is None and not single_chunk:
+            output = torch.empty(
+                (rows, final_topk), dtype=torch.int32, device=q.device
+            )
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
+            chunk_slice = slice(row_start, row_end)
+            chunk_lengths = row_lengths[chunk_slice]
+            logits = triton_qsa_mqa_paged_prefill(
+                q[chunk_slice],
+                compressed_buffer,
+                token_slot_table,
+                token_to_batch_idx[chunk_slice],
+                chunk_lengths,
+                max_row_keys,
+                compress_ratio=self.compress_ratio,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
+            )
+            if use_fast_topk:
+                from sglang.kernels.ops.attention.fast_topk import fast_topk
+
+                block_indices = fast_topk(
+                    logits,
+                    chunk_lengths,
+                    topk=self.block_topk,
+                    row_starts=None,
+                )
+            else:
+                block_indices = qsa_fast_topk(
+                    logits,
+                    torch.zeros_like(chunk_lengths),
+                    chunk_lengths,
+                    topk=self.block_topk,
+                )
+            chunk_out = output[chunk_slice] if output is not None else None
+            selected = expand_qsa_block_indices(
+                block_indices,
+                query_positions[chunk_slice],
+                sequence_lengths_for_rows[chunk_slice],
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+                out=chunk_out,
+            )
+            if single_chunk:
+                return selected
+            del logits, block_indices, selected
+        return output
+
     def select_decode_tokens(
         self,
         q: torch.Tensor,
@@ -739,6 +816,50 @@ class QSAIndexer(MultiPlatformOp):
             ),
         )
 
+    def forward_kv_only(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> None:
+        """Write pending-ring keys and compressed blocks without scoring/top-k.
+        Used by split prefill draft extend on the KV-only (L-1) prefix pass."""
+        logical_positions = getattr(forward_batch, "positions", None)
+        if logical_positions is None:
+            logical_positions = positions[0] if positions.ndim == 2 else positions
+        logical_positions = logical_positions.flatten()
+        num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
+        logical_positions = logical_positions[:num_valid_tokens]
+        hidden_states = hidden_states[:num_valid_tokens]
+        positions = (
+            positions[:, :num_valid_tokens]
+            if positions.ndim == 2
+            else positions[:num_valid_tokens]
+        )
+        state_slots = indexer_metadata.pending_ring_slots
+        if state_slots is None:
+            state_slots = self._pending_ring_slots(
+                indexer_metadata,
+                logical_positions,
+                indexer_metadata.compress_member_rows is not None,
+            )
+        _, token_k, state_stored = self.project_qk(
+            hidden_states,
+            positions,
+            pool=indexer_metadata.token_to_kv_pool,
+            cache_loc=state_slots,
+            q_heads_padded=None,
+        )
+        self.update_key_state_and_compress(
+            token_k,
+            logical_positions,
+            positions,
+            indexer_metadata,
+            state_slots=state_slots,
+            state_stored=state_stored,
+        )
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -853,6 +974,60 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
+        prefill_out = (
+            out[:num_valid_tokens]
+            if out is not None and out.shape[0] >= num_valid_tokens
+            else None
+        )
+        max_row_keys = indexer_metadata.prefill_max_row_keys(
+            getattr(forward_batch, "seq_lens_cpu", None)
+        )
+        pool = getattr(indexer_metadata, "token_to_kv_pool", None)
+        compressed_buffer = (
+            pool.get_qsa_compressed_k_buffer(self.layer_id)
+            if pool is not None and hasattr(pool, "get_qsa_compressed_k_buffer")
+            else None
+        )
+        token_slot_table = getattr(indexer_metadata, "token_slot_table", None)
+        if (
+            max_row_keys is not None
+            and max_row_keys > 0
+            and compressed_buffer is not None
+            and token_slot_table is not None
+            and not is_batch_invariant_mode_enabled()
+            and can_use_triton_qsa_mqa_paged_prefill(
+                q, compressed_buffer, token_slot_table
+            )
+        ):
+            token_to_batch_idx = indexer_metadata.get_token_to_batch_idx()[
+                :num_valid_tokens
+            ]
+            row_lengths = getattr(indexer_metadata, "prefill_row_lengths", None)
+            if row_lengths is None:
+                row_lengths = ((logical_positions + 1) // self.compress_ratio).to(
+                    device=q.device, dtype=torch.int32
+                )
+            row_sequence_lengths = getattr(
+                indexer_metadata, "prefill_row_sequence_lengths", None
+            )
+            if row_sequence_lengths is None:
+                row_sequence_lengths = (
+                    indexer_metadata.sequence_lengths.to(torch.int32).index_select(
+                        0, token_to_batch_idx.long()
+                    )
+                )
+            return self.select_prefill_tokens_paged(
+                q,
+                compressed_buffer,
+                indexer_metadata.token_slot_table,
+                token_to_batch_idx,
+                row_lengths,
+                logical_positions,
+                row_sequence_lengths,
+                max_row_keys=max_row_keys,
+                out=prefill_out,
+            )
+
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
@@ -864,11 +1039,6 @@ class QSAIndexer(MultiPlatformOp):
             row_sequence_lengths = sequence_lengths.index_select(
                 0, query_sequence_ids.long()
             )
-        prefill_out = (
-            out[:num_valid_tokens]
-            if out is not None and out.shape[0] >= num_valid_tokens
-            else None
-        )
         return self.select_prefill_tokens(
             q,
             compressed_keys,
@@ -876,9 +1046,7 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
-            max_row_keys=indexer_metadata.prefill_max_row_keys(
-                getattr(forward_batch, "seq_lens_cpu", None)
-            ),
+            max_row_keys=max_row_keys,
             out=prefill_out,
             prefill_row_lengths=getattr(indexer_metadata, "prefill_row_lengths", None),
         )

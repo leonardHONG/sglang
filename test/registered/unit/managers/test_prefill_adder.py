@@ -3057,6 +3057,92 @@ class TestPrefillAdder(CustomTestCase):
             ).memory_budget.swa_never_fits(**req)
         )
 
+    def test_tail_split_absorption(self):
+        """Absorb tiny chunk overflows (2 * 8244 = 16488 vs 16384) whole when
+        tail_split_tolerance covers the overflow, and keep larger overflows split."""
+        self.mock_token_allocator.available_size.return_value = 200_000
+
+        def make_req(rid: str, length: int):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=128)
+            req.full_untruncated_fill_ids = list(range(length))
+            req.origin_input_ids = list(range(length))
+            return req
+
+        # Without tolerance, second 8244-token req splits into 8128 + 116 tail.
+        adder_strict = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=65536,
+            rem_chunk_tokens=16384,
+            tail_split_tolerance=0,
+        )
+        r1 = make_req("r1", 8244)
+        r2 = make_req("r2", 8244)
+        self.assertEqual(
+            adder_strict.add_one_req(r1, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(
+            adder_strict.add_one_req(r2, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertIs(adder_strict.new_chunked_req, r2)
+        self.assertEqual(r2.extend_end, 8128)
+
+        # With tolerance=256 and matching max_prefill_tokens==chunked_prefill_size==16384
+        # (the real serving default), second 8244-token req is absorbed whole (paged
+        # overflow = 8256 - 8128 = 128 <= 256) and closes the batch cleanly.
+        for rem_in in (16384, 65536):
+            adder_tol = self.create_adder(
+                self.create_running_batch(),
+                page_size=64,
+                rem_input_tokens=rem_in,
+                rem_chunk_tokens=16384,
+                tail_split_tolerance=256,
+            )
+            r3 = make_req(f"r3_{rem_in}", 8244)
+            r4 = make_req(f"r4_{rem_in}", 8244)
+            r5 = make_req(f"r5_{rem_in}", 128)
+            self.assertEqual(
+                adder_tol.add_one_req(
+                    r3, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.CONTINUE,
+            )
+            self.assertEqual(
+                adder_tol.add_one_req(
+                    r4, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.OTHER,
+            )
+            self.assertIsNone(adder_tol.new_chunked_req)
+            self.assertEqual(r4.extend_end, 8244)
+            self.assertLessEqual(adder_tol.rem_chunk_tokens, 0)
+            self.assertEqual(adder_tol.budget_state(), AddReqResult.OTHER)
+            # Once exhausted, an additional request must not be absorbed.
+            self.assertEqual(
+                adder_tol.add_one_req(
+                    r5, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.OTHER,
+            )
+            self.assertEqual(adder_tol.can_run_list, [r3, r4])
+
+        # Overflow exceeding tolerance (8500 -> ceil 8512, overflow 384 > 256) still splits.
+        adder_large = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=65536,
+            rem_chunk_tokens=16384,
+            tail_split_tolerance=256,
+        )
+        r6 = make_req("r6", 8244)
+        r7 = make_req("r7", 8500)
+        adder_large.add_one_req(r6, has_chunked_req=False, truncation_align_size=None)
+        adder_large.add_one_req(r7, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder_large.new_chunked_req, r7)
+        self.assertEqual(r7.extend_end, 8128)
+
 
 if __name__ == "__main__":
     unittest.main()

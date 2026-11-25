@@ -178,6 +178,13 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank > 0
                 and lowrank % 8 == 0
             )
+            self._jit_mix_prefill_ok = (
+                not _is_npu
+                and self.hc_count == 4
+                and self.hidden_size % 32 == 0
+                and lowrank > 0
+                and lowrank % 16 == 0
+            )
             self._mix_up_weight_padded = None
             # Resolved on the first mix(), once the weights are final.
             self._mix_flydsl_ok = None
@@ -393,6 +400,44 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         elif (
+            self._jit_mix_prefill_ok
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.ndim == 2
+            and hyper_input_normed.is_contiguous()
+            and hyper_input_normed.shape[0] >= 48
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and self.input_mix_weight_down.weight.dtype == hyper_input_normed.dtype
+            and self.input_mix_weight_up.weight.dtype == hyper_input_normed.dtype
+            and self.input_mix_weight_up.weight.is_contiguous()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_mix import hc_mix_up_gate
+
+            lowrank = self.input_mix_weight_down.weight.shape[0]
+            if (
+                self._jit_combine_logits_ok
+                and self.block_inject_weight.weight.dtype == hyper_input_normed.dtype
+            ):
+                # Fuse block_inject_weight into the down-projection GEMM, then
+                # run single-kernel hc_mix_up_gate without materializing [M, HC*H] gates.
+                down_and_gate = F.linear(
+                    hyper_input_normed, self._get_fused_down_gate_weight()
+                )
+                gate_state = down_and_gate[:, lowrank : lowrank + self.hc_count]
+                down_proj = down_and_gate
+            else:
+                down_proj = F.linear(
+                    hyper_input_normed, self.input_mix_weight_down.weight
+                )
+            mixed_input = hc_mix_up_gate(
+                hyper_input_normed,
+                down_proj,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+                lowrank,
+            ).to(self.params_dtype)
+        elif (
             self._jit_combine_logits_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.ndim == 2
@@ -402,9 +447,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == hyper_input_normed.dtype
             and not torch.compiler.is_compiling()
         ):
-            # Fuse block_inject_weight into the down-projection TensorCore GEMM
-            # inside the compiled mix graph so combine_and_normalize avoids
-            # re-reading hyper_input_normed on prefill batches.
+            # Fallback when up-projection cannot use hc_mix_up_gate.
             mixed_input, gate_state = self._mix_and_gate_compute(
                 hyper_input_normed,
                 self._get_fused_down_gate_weight(),

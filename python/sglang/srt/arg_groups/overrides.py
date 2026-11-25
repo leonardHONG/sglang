@@ -2174,6 +2174,21 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     return True
 
 
+PREFILL_CHUNK_TAIL_TOLERANCE_MIN_CHUNK = 8192
+PREFILL_CHUNK_TAIL_TOLERANCE_MAX = 256
+
+
+def prefill_chunk_tail_tolerance(chunked_prefill_size: Optional[int]) -> int:
+    """Small overflow allowance to avoid splitting off tiny tail chunks
+    (e.g., 2 * 8244 = 16488 vs chunked_prefill_size=16384)."""
+    if (
+        chunked_prefill_size is None
+        or chunked_prefill_size < PREFILL_CHUNK_TAIL_TOLERANCE_MIN_CHUNK
+    ):
+        return 0
+    return min(PREFILL_CHUNK_TAIL_TOLERANCE_MAX, chunked_prefill_size // 32)
+
+
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
     chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.

@@ -629,7 +629,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             effective_group_size if effective_group_size % 512 == 0 else None
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if (
             not _is_npu
             and x.is_cuda
@@ -640,7 +642,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
                 grouped_gemma_rmsnorm,
             )
 
-            return grouped_gemma_rmsnorm(x, self.weight, self._jit_group_size, self.eps)
+            return grouped_gemma_rmsnorm(
+                x, self.weight, self._jit_group_size, self.eps, out=out
+            )
         compute_dtype = x.dtype
         x_float = x.float()
         if self.group_size is None:
@@ -1269,9 +1273,39 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
+        self._ple_scratch: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
 
-    def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        y = norm(x.flatten(-2, -1))
+    def _get_ple_scratch(
+        self, token_count: int, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cols = self.hc_count * self.hidden_size
+        scratch = self._ple_scratch
+        if (
+            scratch is None
+            or scratch[0].shape[0] < token_count
+            or scratch[0].dtype != dtype
+            or scratch[0].device != device
+        ):
+            cap = max(token_count, scratch[0].shape[0] if scratch is not None else 0)
+            scratch = tuple(
+                torch.empty((cap, cols), dtype=dtype, device=device) for _ in range(3)
+            )
+            self._ple_scratch = scratch
+        return (
+            scratch[0][:token_count],
+            scratch[1][:token_count],
+            scratch[2][:token_count],
+        )
+
+    def _apply_ple_norm(
+        self,
+        norm: nn.Module,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        y = norm(x.flatten(-2, -1), out=out) if out is not None else norm(x.flatten(-2, -1))
         return y.unflatten(-1, (self.hc_count, self.hidden_size))
 
     def _short_conv(
@@ -1279,6 +1313,7 @@ class Qwen4ExpPLELayer(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x
@@ -1315,8 +1350,9 @@ class Qwen4ExpPLELayer(nn.Module):
                 self.short_conv_dilation,
                 track_indices=track_indices,
                 track_offsets=track_offsets,
+                out=out,
             )
-            return F.silu(conv_output)
+            return F.silu(conv_output, inplace=out is not None)
 
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
@@ -1578,10 +1614,24 @@ class Qwen4ExpPLELayer(nn.Module):
                 "PLE hidden size does not match its hyper-connection layout: "
                 f"expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}"
             )
+        use_scratch = (
+            not _is_npu
+            and hidden_states.is_cuda
+            and not sp_active
+            and token_count > 0
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if use_scratch:
+            buf_a, buf_b, buf_c = self._get_ple_scratch(
+                token_count, hidden_states.dtype, hidden_states.device
+            )
+        else:
+            buf_a = buf_b = buf_c = None
+
         key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
-        key_normed = self._apply_ple_norm(self.norm_key, key)
-        query_normed = self._apply_ple_norm(self.norm_query, query)
+        key_normed = self._apply_ple_norm(self.norm_key, key, out=buf_a)
+        query_normed = self._apply_ple_norm(self.norm_query, query, out=buf_b)
         from sglang.kernels.ops.elementwise.qwen4_gate import (
             can_fuse_qwen4_gate_reduce,
             fused_qwen4_gate_reduce,
@@ -1593,7 +1643,14 @@ class Qwen4ExpPLELayer(nn.Module):
             and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
         )
         if fused_gate_reduce:
-            gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
+            gated_value = fused_qwen4_gate_reduce(
+                key_normed,
+                query_normed,
+                value,
+                out=buf_c.view(token_count, hc_count, hidden_size)
+                if buf_c is not None
+                else None,
+            )
         else:
             gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
             gate = gate / math.sqrt(hidden_size)
@@ -1611,7 +1668,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
                 gate = torch.sigmoid(gate)
                 gated_value = gate * value.unsqueeze(-2)
-        gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
+        gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value, out=buf_a)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
         if (
@@ -1666,7 +1723,9 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
                 output = torch.where(valid_tokens, output, 0)
             return output
-        conv_output = self._short_conv(gated_value_normed, forward_batch, batch)
+        conv_output = self._short_conv(
+            gated_value_normed, forward_batch, batch, out=buf_b
+        )
         output = gated_value.add_(conv_output)
         if not batch.use_decode_fast_path and not batch.all_tokens_valid:
             output = torch.where(batch.valid_tokens.unsqueeze(-1), output, 0)
@@ -2244,8 +2303,19 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
+        fuse_qsa_output_gate = (
+            self.is_qsa
+            and gate is not None
+            and hidden_states.is_cuda
+            and not _is_npu
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not _shards_rows_over_cp(forward_batch)
+        )
+        if fuse_qsa_output_gate:
+            attention_kwargs["output_gate"] = gate
+
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
-        if gate is not None:
+        if gate is not None and not fuse_qsa_output_gate:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
@@ -2255,6 +2325,43 @@ class Qwen4ExpAttentionDecoderLayer(
                 attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward_kv_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Populate KV cache and QSA compressed indexer state without running
+        attention, o_proj, HC combine, or FFN/MoE (used by split MTP draft extend)."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        from sglang.srt.layers.attention.qsa.glue import (
+            get_qsa_indexer_metadata,
+            resolve_qsa_sparse_backend,
+        )
+
+        hidden_states = self._widen_streams(hidden_states)
+        norm_hidden = self.attn_hyper_connection.mix(hidden_states)[0]
+        _, k, v, _ = self._prepare_qkv_gate(
+            positions=positions,
+            hidden_states=norm_hidden,
+            forward_batch=forward_batch,
+        )
+        backend = get_attn_backend()
+        sparse_backend = resolve_qsa_sparse_backend(backend)
+        k_3d = k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim)
+        v_3d = v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim)
+        sparse_backend.kv_layers.layer(self.layer_id).store(
+            self.attn, forward_batch.out_cache_loc, k_3d, v_3d
+        )
+        if self.is_qsa:
+            indexer_metadata = get_qsa_indexer_metadata(
+                backend, self.layer_id, forward_batch
+            )
+            self.indexer.forward_kv_only(
+                norm_hidden, positions, forward_batch, indexer_metadata
+            )
 
     def forward(
         self,
@@ -2468,6 +2575,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Single-layer MTP draft KV-only pass: writes KV & QSA indexer state."""
+        assert len(self.layers) == 1 and self.start_layer == 0 and self.end_layer == 1
+        hidden_states = (
+            inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        )
+        self.layers[0].forward_kv_only(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):

@@ -457,8 +457,273 @@ def qsa_sparse_attention_reference(
     return torch.stack(outputs)
 
 
+@triton.jit(do_not_specialize=["num_tokens", "batch_size"])
+def _qsa_prefill_token_meta_kernel(
+    extend_cu_ends,
+    seq_lens,
+    req_pool_indices,
+    compressed_cu_seqlens,
+    logical_positions,
+    out_token_to_batch_idx,
+    out_row_starts,
+    out_row_ends,
+    out_row_lengths,
+    out_row_seq_lens,
+    out_pending_ring_slots,
+    num_tokens,
+    batch_size,
+    RATIO: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_tokens
+    # Binary search smallest b in [0, batch_size - 1] with offs < extend_cu_ends[b].
+    lo = tl.zeros((BLOCK,), dtype=tl.int32)
+    hi = tl.full((BLOCK,), batch_size - 1, dtype=tl.int32)
+    steps = batch_size
+    while steps > 1:
+        mid = (lo + hi) // 2
+        bound = tl.load(extend_cu_ends + mid, mask=mask, other=0)
+        go_right = offs >= bound
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+        steps = (steps + 1) // 2
+    b = lo
+
+    seq_len = tl.load(seq_lens + b, mask=mask, other=0).to(tl.int32)
+    req_slot = tl.load(req_pool_indices + b, mask=mask, other=0).to(tl.int64)
+    row_start = tl.load(compressed_cu_seqlens + b, mask=mask, other=0).to(tl.int32)
+    next_start = tl.load(compressed_cu_seqlens + b + 1, mask=mask, other=0).to(tl.int32)
+    max_blocks = next_start - row_start
+    pos = tl.load(logical_positions + offs, mask=mask, other=0).to(tl.int64)
+
+    pos_i32 = pos.to(tl.int32)
+    visible_blocks = (pos_i32 + 1) // RATIO
+    row_len = tl.minimum(visible_blocks, max_blocks)
+    row_end = row_start + row_len
+
+    tail_base = ((seq_len // RATIO) * RATIO).to(tl.int64)
+    rem = pos % RATIO
+    ring_slot = tl.where(pos >= tail_base, req_slot * RATIO + rem, rem)
+
+    tl.store(out_token_to_batch_idx + offs, b, mask=mask)
+    tl.store(out_row_starts + offs, row_start, mask=mask)
+    tl.store(out_row_ends + offs, row_end, mask=mask)
+    tl.store(out_row_lengths + offs, row_len, mask=mask)
+    tl.store(out_row_seq_lens + offs, seq_len, mask=mask)
+    tl.store(out_pending_ring_slots + offs, ring_slot, mask=mask)
+
+
+@triton.jit(do_not_specialize=["total_groups", "batch_size", "table_stride", "num_tokens"])
+def _qsa_prefill_write_plan_kernel(
+    group_cu_ends,
+    start_blocks,
+    row_token_starts,
+    token_slot_table,
+    out_write_locs,
+    out_group_end_positions,
+    out_group_sequence_ids,
+    out_group_member_rows,
+    out_compress_group_locs,
+    total_groups,
+    batch_size,
+    table_stride,
+    num_tokens,
+    RATIO: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_groups
+    lo = tl.zeros((BLOCK,), dtype=tl.int32)
+    hi = tl.full((BLOCK,), batch_size - 1, dtype=tl.int32)
+    steps = batch_size
+    while steps > 1:
+        mid = (lo + hi) // 2
+        bound = tl.load(group_cu_ends + mid, mask=mask, other=0)
+        go_right = offs >= bound
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+        steps = (steps + 1) // 2
+    b = lo
+
+    prev_end = tl.where(
+        b > 0,
+        tl.load(group_cu_ends + tl.maximum(b - 1, 0), mask=mask & (b > 0), other=0),
+        0,
+    )
+    local_g = offs - prev_end
+    start_b = tl.load(start_blocks + b, mask=mask, other=0)
+    tok_start = tl.load(row_token_starts + b, mask=mask, other=0)
+    block_idx = start_b + local_g
+
+    slot0 = tl.load(
+        token_slot_table
+        + b.to(tl.int64) * table_stride
+        + block_idx.to(tl.int64) * RATIO,
+        mask=mask,
+        other=0,
+    ).to(tl.int64)
+    write_loc = (slot0 // RATIO).to(tl.int32)
+    group_end_pos = (block_idx.to(tl.int64) * RATIO + (RATIO - 1))
+    member_row = (tok_start + local_g * RATIO).to(tl.int64)
+
+    tl.store(out_write_locs + offs, write_loc, mask=mask)
+    tl.store(out_group_end_positions + offs, group_end_pos, mask=mask)
+    tl.store(out_group_sequence_ids + offs, b.to(tl.int64), mask=mask)
+    tl.store(out_group_member_rows + offs, member_row, mask=mask)
+
+    max_tok = num_tokens - 1
+    base_i32 = member_row.to(tl.int32)
+    offs64 = offs.to(tl.int64)
+    for r in tl.static_range(RATIO):
+        tl.store(
+            out_compress_group_locs + offs64 * RATIO + r,
+            tl.minimum(base_i32 + r, max_tok),
+            mask=mask,
+        )
+
+
+def build_qsa_prefill_metadata_fused(
+    *,
+    extend_lens_cpu: list[int],
+    seq_lens_cpu: list[int],
+    sequence_lengths: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    token_slot_table: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compress_ratio: int,
+):
+    """Build all per-token and per-group QSA prefill metadata tensors in 2 Triton
+    launches + 1 packed pinned HtoD instead of ~85 tiny PyTorch ops."""
+    device = sequence_lengths.device
+    batch_size = len(extend_lens_cpu)
+    num_tokens = 0
+    total_groups = 0
+    comp_total = 0
+
+    # Pack 4 small int32 host arrays into one pinned transfer:
+    # [extend_cu_seqlens(B+1), compressed_cu_seqlens(B+1),
+    #  start_blocks(B), group_cu_ends(B)]
+    # row_token_starts = extend_cu_seqlens[:-1], extend_cu_ends = extend_cu_seqlens[1:].
+    packed_len = 4 * batch_size + 2
+    packed_cpu = torch.empty(
+        packed_len, dtype=torch.int32, pin_memory=device.type == "cuda"
+    )
+    arr = packed_cpu.numpy()
+    off_ext = 0
+    off_comp = batch_size + 1
+    off_sb = 2 * batch_size + 2
+    off_grp = 3 * batch_size + 2
+
+    arr[off_ext] = 0
+    arr[off_comp] = 0
+    for i in range(batch_size):
+        ext_l = int(extend_lens_cpu[i])
+        seq_l = int(seq_lens_cpu[i])
+        pref_l = max(0, seq_l - ext_l)
+        sb = pref_l // compress_ratio
+        eb = seq_l // compress_ratio
+        cnt = max(0, eb - sb)
+        num_tokens += ext_l
+        arr[off_ext + i + 1] = num_tokens
+        comp_total += eb
+        arr[off_comp + i + 1] = comp_total
+        arr[off_sb + i] = sb
+        total_groups += cnt
+        arr[off_grp + i] = total_groups
+
+    packed_dev = packed_cpu.to(device, non_blocking=True)
+    extend_cu_seqlens = packed_dev[off_ext : off_ext + batch_size + 1]
+    extend_cu_ends = extend_cu_seqlens[1:]
+    row_token_starts = extend_cu_seqlens[:-1]
+    compressed_cu_seqlens = packed_dev[off_comp : off_comp + batch_size + 1]
+    start_blocks = packed_dev[off_sb : off_sb + batch_size]
+    group_cu_ends = packed_dev[off_grp : off_grp + batch_size]
+
+    token_to_batch_idx = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    prefill_row_starts = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    prefill_row_ends = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    prefill_row_lengths = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    prefill_row_sequence_lengths = torch.empty(
+        num_tokens, dtype=torch.int32, device=device
+    )
+    pending_ring_slots = torch.empty(num_tokens, dtype=torch.int64, device=device)
+
+    block = 256
+    _qsa_prefill_token_meta_kernel[(triton.cdiv(num_tokens, block),)](
+        extend_cu_ends,
+        sequence_lengths,
+        req_pool_indices,
+        compressed_cu_seqlens,
+        logical_positions,
+        token_to_batch_idx,
+        prefill_row_starts,
+        prefill_row_ends,
+        prefill_row_lengths,
+        prefill_row_sequence_lengths,
+        pending_ring_slots,
+        num_tokens,
+        batch_size,
+        RATIO=compress_ratio,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+    if total_groups > 0:
+        write_locs = torch.empty(total_groups, dtype=torch.int32, device=device)
+        group_end_positions = torch.empty(
+            total_groups, dtype=torch.int64, device=device
+        )
+        group_sequence_ids = torch.empty(total_groups, dtype=torch.int64, device=device)
+        group_member_rows = torch.empty(total_groups, dtype=torch.int64, device=device)
+        prefill_compress_group_locs = torch.empty(
+            (total_groups, compress_ratio), dtype=torch.int32, device=device
+        )
+        _qsa_prefill_write_plan_kernel[(triton.cdiv(total_groups, block),)](
+            group_cu_ends,
+            start_blocks,
+            row_token_starts,
+            token_slot_table,
+            write_locs,
+            group_end_positions,
+            group_sequence_ids,
+            group_member_rows,
+            prefill_compress_group_locs,
+            total_groups,
+            batch_size,
+            token_slot_table.stride(0),
+            num_tokens,
+            RATIO=compress_ratio,
+            BLOCK=block,
+            num_warps=4,
+        )
+    else:
+        write_locs = torch.empty(0, dtype=torch.int32, device=device)
+        group_end_positions = torch.empty(0, dtype=torch.int64, device=device)
+        group_sequence_ids = torch.empty(0, dtype=torch.int64, device=device)
+        group_member_rows = torch.empty(0, dtype=torch.int64, device=device)
+        prefill_compress_group_locs = None
+
+    return (
+        token_to_batch_idx,
+        write_locs,
+        group_end_positions,
+        group_sequence_ids,
+        group_member_rows,
+        pending_ring_slots,
+        prefill_row_starts,
+        prefill_row_ends,
+        compressed_cu_seqlens,
+        prefill_row_sequence_lengths,
+        prefill_row_lengths,
+        prefill_compress_group_locs,
+        extend_cu_seqlens,
+    )
+
+
 __all__ = [
     "average_pool_qsa_keys",
+    "build_qsa_prefill_metadata_fused",
     "expand_qsa_block_indices",
     "gather_qsa_compressed_keys",
     "torch_expand_qsa_block_indices",

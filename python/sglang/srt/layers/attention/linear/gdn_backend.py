@@ -892,6 +892,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             n_tok, first_v_heads, dim
                         )
                         module(x_tmp, z_3d)
+        # Prewarm fused GDN state-tracking scatter/copy kernels.
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            copy_indexed_ssm_rows,
+            scatter_conv_track_rows,
+        )
+
+        ssm_pool_dtype = self.state_pool.mamba_cache.temporal.dtype
+        for _, num_v_heads, head_k_dim, head_v_dim in geometries:
+            dummy_ssm = torch.zeros(
+                (2, num_v_heads, head_v_dim, head_k_dim),
+                dtype=ssm_pool_dtype,
+                device=device,
+            )
+            for idx_dtype in (torch.int32, torch.int64):
+                idx0 = torch.zeros((1,), dtype=idx_dtype, device=device)
+                idx1 = torch.ones((1,), dtype=idx_dtype, device=device)
+                copy_indexed_ssm_rows(dummy_ssm, idx0, dummy_ssm, idx1)
+            # Also warm mixed int64 src + int32 dst (FlashInfer checkpoint tracking).
+            copy_indexed_ssm_rows(
+                dummy_ssm,
+                torch.zeros((1,), dtype=torch.int64, device=device),
+                dummy_ssm,
+                torch.ones((1,), dtype=torch.int32, device=device),
+            )
+        if conv_prewarmed:
+            first_qkv_dim = next(iter(conv_prewarmed))[0]
+            dummy_qkv = torch.zeros(
+                (max(conv_state_len + 1, 8), first_qkv_dim),
+                dtype=io_dtype,
+                device=device,
+            )
+            dummy_conv = torch.zeros(
+                (2, first_qkv_dim, conv_state_len),
+                dtype=conv_state_dtype,
+                device=device,
+            )
+            for idx_dtype in (torch.int32, torch.int64):
+                t_idx = torch.arange(
+                    conv_state_len, dtype=idx_dtype, device=device
+                ).unsqueeze(0)
+                d_idx = torch.zeros((1,), dtype=idx_dtype, device=device)
+                scatter_conv_track_rows(dummy_qkv, t_idx, dummy_conv, d_idx)
         if conv_prewarmed or prep_prewarmed or norm_prewarmed:
             torch.cuda.current_stream(device).synchronize()
         if num_runs:
@@ -1724,12 +1766,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    forward_metadata.track_conv_indices
-                ].transpose(1, 2)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                    scatter_conv_track_rows,
                 )
+
+                if not scatter_conv_track_rows(
+                    mixed_qkv,
+                    forward_metadata.track_conv_indices,
+                    conv_states,
+                    forward_metadata.conv_states_mask_indices,
+                ):
+                    mixed_qkv_to_track = mixed_qkv[
+                        forward_metadata.track_conv_indices
+                    ].transpose(1, 2)
+                    conv_states[forward_metadata.conv_states_mask_indices] = (
+                        mixed_qkv_to_track
+                    )
 
             mixed_qkv = self._convolve_prefill(
                 layer,

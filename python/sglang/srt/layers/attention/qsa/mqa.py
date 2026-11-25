@@ -22,6 +22,16 @@ except ImportError:
     pass
 
 try:
+    import triton
+    import triton.language as tl
+
+    HAS_TRITON = True
+except ImportError:
+    triton = None
+    tl = None
+    HAS_TRITON = False
+
+try:
     import tilelang
     from tilelang import language as T
 
@@ -719,6 +729,244 @@ def tilelang_qsa_mqa_decode(
     return logits
 
 
+if HAS_TRITON:
+
+    @triton.jit(do_not_specialize=["rows", "width", "st_row", "sl_m", "min_scored_len"])
+    def _qsa_mqa_paged_prefill_kernel(
+        q_ptr,
+        compressed_k_ptr,
+        token_slot_table_ptr,
+        token_to_batch_ptr,
+        row_lens_ptr,
+        logits_ptr,
+        rows,
+        width,
+        st_row,
+        sl_m,
+        inv_scale,
+        min_scored_len,
+        HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        RATIO: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        K_TILES: tl.constexpr,
+        STAGES: tl.constexpr,
+        MASK_TAIL: tl.constexpr,
+        TRANSPOSE_STORE: tl.constexpr,
+    ):
+        """2D-tiled paged prefill MQA reading directly from the compressed-K pool
+        without gathering compressed keys into a contiguous scratch buffer.
+
+        Each CTA keeps a transposed ``[HEAD_DIM, BLOCK_Q * HEADS]`` query tile
+        resident while streaming up to ``K_TILES`` key blocks with
+        ``eviction_policy="evict_first"`` and software pipelining."""
+        pid_q = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        q_start = pid_q * BLOCK_Q
+        k_tile_start = pid_k * K_TILES
+
+        q_offs = q_start + tl.arange(0, BLOCK_Q)
+        row_valid = q_offs < rows
+        row_lens = tl.load(row_lens_ptr + q_offs, mask=row_valid, other=0)
+        block_max_len = tl.max(tl.where(row_valid, row_lens, 0), axis=0)
+        if block_max_len <= min_scored_len or k_tile_start * BLOCK_K >= block_max_len:
+            return
+
+        row_reqs = tl.load(token_to_batch_ptr + q_offs, mask=row_valid, other=-1)
+        req_min = tl.min(tl.where(row_valid, row_reqs, 2147483647), axis=0)
+        req_max = tl.max(tl.where(row_valid, row_reqs, -1), axis=0)
+
+        d_offs = tl.arange(0, HEAD_DIM)
+        m_offs = tl.arange(0, BLOCK_Q * HEADS)
+        q_flat_offs = (q_start * HEADS) + m_offs
+        q_flat_valid = q_flat_offs < (rows * HEADS)
+        q_tile = tl.load(
+            q_ptr + q_flat_offs[None, :].to(tl.int64) * HEAD_DIM + d_offs[:, None],
+            mask=q_flat_valid[None, :],
+            other=0.0,
+        )
+
+        k_col_offs = tl.arange(0, BLOCK_K)
+        for req in range(req_min, req_max + 1):
+            req_mask = row_valid & (row_reqs == req)
+            req_max_len = tl.max(tl.where(req_mask, row_lens, 0), axis=0)
+            if req_max_len > min_scored_len and k_tile_start * BLOCK_K < req_max_len:
+                k_tile_end = tl.minimum(
+                    k_tile_start + K_TILES,
+                    tl.cdiv(tl.minimum(req_max_len, width), BLOCK_K),
+                )
+                for tile in tl.range(k_tile_start, k_tile_end, num_stages=STAGES):
+                    k_offs = tile * BLOCK_K + k_col_offs
+                    valid_k = k_offs < req_max_len
+                    first_slots = tl.load(
+                        token_slot_table_ptr
+                        + req.to(tl.int64) * st_row
+                        + (k_offs * RATIO).to(tl.int64),
+                        mask=valid_k,
+                        other=0,
+                    ).to(tl.int64)
+                    comp_slots = first_slots // RATIO
+                    k_tile = tl.load(
+                        compressed_k_ptr
+                        + comp_slots[:, None] * HEAD_DIM
+                        + d_offs[None, :],
+                        mask=valid_k[:, None],
+                        other=0.0,
+                        eviction_policy="evict_first",
+                    )
+                    scores = tl.dot(k_tile, q_tile, out_dtype=tl.float32)
+                    scores_3d = tl.reshape(scores, [BLOCK_K, BLOCK_Q, HEADS])
+                    reduced = tl.sum(tl.maximum(scores_3d, 0.0), axis=2) * inv_scale
+                    if MASK_TAIL:
+                        reduced = tl.where(
+                            k_offs[:, None] < row_lens[None, :],
+                            reduced,
+                            -float("inf"),
+                        )
+                        store_mask = req_mask[None, :] & (k_offs[:, None] < width)
+                    else:
+                        store_mask = (
+                            req_mask[None, :]
+                            & (k_offs[:, None] < row_lens[None, :])
+                            & (k_offs[:, None] < width)
+                        )
+                    if TRANSPOSE_STORE:
+                        tl.store(
+                            logits_ptr
+                            + q_offs[:, None].to(tl.int64) * sl_m
+                            + k_offs[None, :],
+                            tl.trans(reduced),
+                            mask=tl.trans(store_mask),
+                        )
+                    else:
+                        tl.store(
+                            logits_ptr
+                            + q_offs[None, :].to(tl.int64) * sl_m
+                            + k_offs[:, None],
+                            reduced,
+                            mask=store_mask,
+                        )
+
+
+def can_use_triton_qsa_mqa_paged_prefill(
+    q: torch.Tensor,
+    compressed_k: torch.Tensor,
+    token_slot_table: torch.Tensor,
+) -> bool:
+    if (
+        not HAS_TRITON
+        or _is_npu
+        or is_hip()
+        or not q.is_cuda
+        or not compressed_k.is_cuda
+        or not token_slot_table.is_cuda
+    ):
+        return False
+    if torch.cuda.get_device_capability(q.device) < (9, 0):
+        return False
+    if q.dtype != compressed_k.dtype or q.dtype not in (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+    ):
+        return False
+    if (
+        compressed_k.ndim != 3
+        or compressed_k.shape[1] != 1
+        or not compressed_k.is_contiguous()
+        or token_slot_table.stride(-1) != 1
+    ):
+        return False
+    heads, head_dim = q.shape[1], q.shape[2]
+    return (
+        heads > 0
+        and (heads & (heads - 1)) == 0
+        and head_dim >= 32
+        and (head_dim & (head_dim - 1)) == 0
+        and compressed_k.shape[2] == head_dim
+    )
+
+
+def triton_qsa_mqa_paged_prefill(
+    q: torch.Tensor,
+    compressed_k: torch.Tensor,
+    token_slot_table: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    row_lengths: torch.Tensor,
+    width: int,
+    *,
+    compress_ratio: int,
+    score_scale: Optional[float] = None,
+    min_scored_len: int = 0,
+    block_q: Optional[int] = None,
+    block_k: Optional[int] = None,
+    k_tiles: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: int = 2,
+    transpose_store: bool = False,
+) -> torch.Tensor:
+    """Fast SM90+ Triton paged prefill MQA directly over compressed-K pool."""
+    rows, heads, head_dim = q.shape
+    if min_scored_len > 0:
+        logits = torch.empty((rows, width), dtype=torch.float32, device=q.device)
+        mask_tail = False
+    else:
+        logits = torch.full(
+            (rows, width), -float("inf"), dtype=torch.float32, device=q.device
+        )
+        mask_tail = True
+    if rows == 0 or width == 0:
+        return logits
+
+    q_contig = q.contiguous()
+    row_lens_i32 = row_lengths.to(device=q.device, dtype=torch.int32).contiguous()
+    tok_batch_i32 = token_to_batch_idx.to(
+        device=q.device, dtype=torch.int32
+    ).contiguous()
+
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    if block_q is not None:
+        bq = block_q
+    elif is_fp8:
+        bq = 32 if heads <= 4 else max(16, 128 // heads)
+    else:
+        bq = 64 if heads <= 4 else max(16, 256 // heads)
+    if bq * heads < 16:
+        bq = 16 // heads
+    bk = block_k if block_k is not None else 64
+    kt = k_tiles if k_tiles is not None else 16
+    warps = num_warps if num_warps is not None else (8 if is_fp8 else 4)
+    inv_scale = 1.0 / float(score_scale or math.sqrt(head_dim))
+
+    grid = (triton.cdiv(rows, bq), triton.cdiv(width, bk * kt))
+    _qsa_mqa_paged_prefill_kernel[grid](
+        q_contig,
+        compressed_k,
+        token_slot_table,
+        tok_batch_i32,
+        row_lens_i32,
+        logits,
+        rows,
+        width,
+        token_slot_table.stride(0),
+        logits.stride(0),
+        inv_scale,
+        min_scored_len,
+        HEADS=heads,
+        HEAD_DIM=head_dim,
+        RATIO=compress_ratio,
+        BLOCK_Q=bq,
+        BLOCK_K=bk,
+        K_TILES=kt,
+        STAGES=num_stages,
+        MASK_TAIL=mask_tail,
+        TRANSPOSE_STORE=transpose_store,
+        num_warps=warps,
+        num_stages=num_stages,
+    )
+    return logits
+
+
 def qsa_mqa_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -789,6 +1037,8 @@ def qsa_mqa_decode(
 
 __all__ = [
     "HAS_TILELANG",
+    "HAS_TRITON",
+    "can_use_triton_qsa_mqa_paged_prefill",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "qsa_mqa_prefill_relative",
@@ -798,4 +1048,5 @@ __all__ = [
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
     "torch_qsa_mqa_prefill_relative",
+    "triton_qsa_mqa_paged_prefill",
 ]

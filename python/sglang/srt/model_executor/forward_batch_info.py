@@ -1685,6 +1685,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
 
+        # Fast path for text-only extend: positions are already on device, so
+        # avoid building CPU ranges and issuing a blocking pageable HtoD copy.
+        if (
+            self.positions is not None
+            and self.positions.ndim == 1
+            and (
+                rl_on_policy_target is not None
+                or not any(mm is not None for mm in mm_inputs)
+            )
+        ):
+            self.mrope_positions = (
+                self.positions.to(dtype=torch.int64, device=model_runner.device)
+                .unsqueeze(0)
+                .repeat(3, 1)
+            )
+            return
+
         # Optimize text-only branch with torch.arange
         mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
@@ -1727,10 +1744,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            mrope_positions_list,
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        mrope_cpu = torch.cat(mrope_positions_list, dim=1).to(dtype=torch.int64)
+        if is_pin_memory_available(model_runner.device) and mrope_cpu.device.type == "cpu":
+            mrope_cpu = mrope_cpu.pin_memory()
+        self.mrope_positions = mrope_cpu.to(
+            dtype=torch.int64, device=model_runner.device, non_blocking=True
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_resources,
     get_schedule,
     get_serving,
     get_spec,
@@ -4715,6 +4716,34 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        tail_split_tolerance = 0
+        if (
+            chunked_prefill_size is not None
+            and chunked_prefill_size >= 8192
+            and self.dllm_config is None
+            and self.dynamic_chunk_sizer is None
+            and not self.is_mixed_chunk
+            and get_parallel().pp_size == 1
+            and get_parallel().ep_size == 1
+            and get_parallel().dp_size == 1
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not self.model_config.use_ngram_embedding
+            and getattr(attn_backend, "prefill_kernel_max_seqlen_q_grid", None) is None
+            and get_resources().buffers.get("trtllm_gen_mxfp4_moe_workspace") is None
+        ):
+            from sglang.srt.arg_groups.overrides import prefill_chunk_tail_tolerance
+
+            tail_split_tolerance = prefill_chunk_tail_tolerance(chunked_prefill_size)
+            prefill_graph_runner = (
+                self.tp_worker.model_runner.prefill_cuda_graph_runner
+            )
+            graph_max_tokens = getattr(prefill_graph_runner, "max_num_tokens", None)
+            if graph_max_tokens is not None:
+                tail_split_tolerance = min(
+                    tail_split_tolerance,
+                    max(0, graph_max_tokens - chunked_prefill_size),
+                )
+
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4734,6 +4763,7 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
+            tail_split_tolerance=tail_split_tolerance,
         )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.

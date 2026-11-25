@@ -1093,6 +1093,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        tail_split_tolerance: int = 0,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -1196,6 +1197,9 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        # Small overflow tolerance to absorb tiny tail chunks (e.g., 2 * 8244 =
+        # 16488 vs 16384) whole instead of splitting off a <256-token fragment.
+        self.tail_split_tolerance = max(0, int(tail_split_tolerance))
 
     def _admitted_extend_lens(self) -> List[int]:
         return [req.extend_len for req in self.can_run_list]
@@ -1779,6 +1783,20 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        if (
+            self.dllm_config is None
+            and self.tail_split_tolerance > 0
+            and self.chunked_req_limit is None
+            and self.kv_shard_granule == 0
+            and _rem_tokens is not None
+            and _rem_tokens == self.rem_chunk_tokens
+            and 0 < _rem_tokens < cand_extend_input_len
+            and self.ceil_paged_tokens(cand_extend_input_len)
+            <= _rem_tokens + self.tail_split_tolerance
+            and self.ceil_paged_tokens(cand_extend_input_len)
+            <= self.rem_input_tokens + self.tail_split_tolerance
+        ):
+            _rem_tokens = self.ceil_paged_tokens(cand_extend_input_len)
         _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
         prefix_tokens = 0
         if is_cp_sharded_padded():
@@ -1903,6 +1921,15 @@ class PrefillAdder:
         )
         # The chunk limit this request runs and commits at.
         chunk_limit = self.rem_chunk_tokens
+        if (
+            chunk_limit is not None
+            and self.tail_split_tolerance > 0
+            and self.dllm_config is None
+            and self.kv_shard_scratch_spec is None
+            and 0 < chunk_limit < storage_input_len <= chunk_limit + self.tail_split_tolerance
+            and storage_input_len <= self.rem_input_tokens + self.tail_split_tolerance
+        ):
+            chunk_limit = storage_input_len
         if self.memory_budget.admits_whole_requests:
             can_admit, chunk_limit = self._check_prefill_budget(
                 req,
@@ -1915,7 +1942,7 @@ class PrefillAdder:
                 ),
                 state_slots=self._state_slots_for_req(req),
                 window_host_hit_lengths={},
-                chunk_limit=self.rem_chunk_tokens,
+                chunk_limit=chunk_limit,
                 chunk_align=truncation_align_size,
             )
             if not can_admit:
@@ -2325,6 +2352,17 @@ class PrefillAdder:
             chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
+        if (
+            chunk_limit is not None
+            and self.tail_split_tolerance > 0
+            and not has_chunked_req
+            and self.dllm_config is None
+            and self.kv_shard_scratch_spec is None
+            and 0 < chunk_limit < chunk_fit_tokens <= chunk_limit + self.tail_split_tolerance
+            and (chunk_fit_tokens + replay_len)
+            <= self.rem_input_tokens + self.tail_split_tolerance
+        ):
+            chunk_limit = chunk_fit_tokens
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
             req,
             extend_input_len=extend_len,

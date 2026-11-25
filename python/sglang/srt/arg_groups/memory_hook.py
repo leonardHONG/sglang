@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     post_capture_kv_sizing_planned,
+    prefill_chunk_tail_tolerance,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
@@ -243,6 +244,8 @@ def handle_gpu_memory_settings(server_args: Any):
         )
         decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
+    prefill_max_bs_is_default = prefill_cuda_graph_config.max_bs is None
+    prefill_bs_is_default = prefill_cuda_graph_config.bs is None
     if prefill_cuda_graph_config.max_bs is None:
         # Default to the chunked prefill size; cap MLA capture at 8192 tokens.
         if not use_mla_backend(server_args):
@@ -279,6 +282,31 @@ def handle_gpu_memory_settings(server_args: Any):
         prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
             prefill_cuda_graph_config.max_bs
         )
+        # Add one extra top bucket to keep Breakable Prefill CUDA Graphs active
+        # when PrefillAdder absorbs tiny chunk tail overflows (e.g., 2 * 8244 = 16488
+        # vs chunked_prefill_size=16384 -> bucket 16640).
+        tail_tol = prefill_chunk_tail_tolerance(cfg.chunked_prefill_size)
+        if (
+            tail_tol > 0
+            and prefill_max_bs_is_default
+            and prefill_bs_is_default
+            and cfg.device != "cpu"
+            and prefill_cuda_graph_config.backend == Backend.BREAKABLE
+            and cfg.pp_size == 1
+            and cfg.ep_size == 1
+            and cfg.dp_size == 1
+            and not use_mla_backend(server_args)
+            and prefill_cuda_graph_config.max_bs == cfg.chunked_prefill_size
+            and (
+                cfg.max_total_tokens is None
+                or cfg.max_total_tokens >= prefill_cuda_graph_config.max_bs + tail_tol
+            )
+            and "llama-2" not in cfg.model_path.lower()
+        ):
+            extra_bucket = prefill_cuda_graph_config.max_bs + tail_tol
+            if extra_bucket not in prefill_cuda_graph_config.bs:
+                prefill_cuda_graph_config.bs.append(extra_bucket)
+            prefill_cuda_graph_config.max_bs = extra_bucket
 
     if cuda_graph_config != cfg.cuda_graph_config:
         declare_resolution(

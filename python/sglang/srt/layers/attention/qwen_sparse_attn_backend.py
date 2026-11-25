@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
 from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
+    build_qsa_prefill_metadata_fused,
     expand_qsa_block_indices,
     qsa_sparse_attention,
 )
@@ -245,6 +246,9 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # token_slot_table translated to rows of the KV-shard scratch, during a
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
+    # Cached int32 cumulative query offsets for prefill extend (avoids per-layer
+    # cumsum + F.pad in forward_extend).
+    prefill_cu_seqlens_q: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -814,24 +818,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                token_to_batch_idx = _extend_token_to_batch_idx(
-                    extend_seq_lens=extend_seq_lens,
-                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                    batch_size=batch_size,
-                    device=sequence_lengths.device,
-                )
-                # More mapped rows than physical would index past them;
-                # fewer is fine (DP MAX_LEN padding is trimmed downstream).
-                if token_to_batch_idx.numel() > num_position_tokens:
-                    raise ValueError(
-                        "QSA extend request mapping exceeds token rows: "
-                        f"mapping={token_to_batch_idx.numel()}, "
-                        f"positions={num_position_tokens}"
-                    )
                 if forward_batch.seq_lens_cpu is not None:
                     prefill_sequence_lengths_cpu = tuple(
                         forward_batch.seq_lens_cpu[:batch_size].tolist()
                     )
+                token_to_batch_idx = None
         decode_page_table = None
         decode_lengths = None
         decode_logical_positions = None
@@ -847,129 +838,224 @@ class QwenSparseAttnBackend(AttentionBackend):
         write_locs_int32 = None
         mixed_ring_write_locs = None
         mixed_ring_group_locs = None
-        write_locs, group_positions, group_sequence_ids, group_member_rows = (
-            self._qsa_build_write_plan(
-                forward_batch=forward_batch,
-                speculative_paged=speculative_paged,
-                token_slot_table=token_slot_table,
-                sequence_lengths=sequence_lengths,
-            )
-        )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
-        extend_prefix_lens_for_ring = None
-        if decode_like:
-            decode_logical_positions = (
-                logical_positions.to(torch.int32)
-                if speculative_paged
-                else sequence_lengths - 1
-            )
-            ring_logical_positions = decode_logical_positions
-        else:
-            extend_positions = forward_batch.positions
-            if extend_positions.ndim == 2:
-                extend_positions = extend_positions[0]
-            ring_logical_positions = extend_positions.flatten()[
-                : token_to_batch_idx.numel()
+
+        # Fast fused CUDA prefill metadata path: replaces ~85 tiny PyTorch ops
+        # (_extend_token_to_batch_idx, _qsa_build_write_plan, _qsa_write_plan,
+        # build_pending_ring_slots, build_qsa_row_ranges, etc.) with 2 Triton
+        # kernels + 1 packed pinned HtoD.
+        used_fused_prefill_meta = False
+        prefill_cu_seqlens_q = None
+        if (
+            not decode_like
+            and not _is_npu
+            and sequence_lengths.is_cuda
+            and not forward_batch.forward_mode.is_mixed()
+            and not self.should_reuse_mtp_sparse_indices(forward_batch)
+            and forward_batch.extend_seq_lens_cpu is not None
+            and forward_batch.seq_lens_cpu is not None
+            and token_slot_table.stride(-1) == 1
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            ext_lens_list = [
+                int(x) for x in forward_batch.extend_seq_lens_cpu[:batch_size]
             ]
-            has_unaligned_prefix = forward_batch.forward_mode.is_mixed()
-            extend_prefix_lens_cpu = getattr(
-                forward_batch, "extend_prefix_lens_cpu", None
-            )
-            if not has_unaligned_prefix and extend_prefix_lens_cpu is not None:
-                has_unaligned_prefix = any(
-                    int(p) % self.compress_ratio != 0
-                    for p in extend_prefix_lens_cpu[: sequence_lengths.numel()]
+            seq_lens_list = [int(x) for x in forward_batch.seq_lens_cpu[:batch_size]]
+            total_ext_tokens = sum(ext_lens_list)
+            ratio = self.compress_ratio
+            if (
+                total_ext_tokens > 0
+                and total_ext_tokens <= num_position_tokens
+                and all(
+                    s >= e >= 0
+                    and (s - e) % ratio == 0
+                    and (s // ratio) * ratio <= token_slot_table.shape[1]
+                    for s, e in zip(seq_lens_list, ext_lens_list)
                 )
-            if has_unaligned_prefix and forward_batch.extend_seq_lens is not None:
-                ext_l = forward_batch.extend_seq_lens.long()[: sequence_lengths.numel()]
-                pref_l = (sequence_lengths.long() - ext_l).clamp_min(0)
-                extend_prefix_lens_for_ring = pref_l
-                end_b = sequence_lengths.long() // self.compress_ratio
-                ring_start_b = pref_l // self.compress_ratio
-                ring_end_b = torch.where(
-                    (pref_l % self.compress_ratio != 0) & (end_b > ring_start_b),
-                    ring_start_b + 1,
-                    ring_start_b,
+            ):
+                extend_positions = forward_batch.positions
+                if extend_positions.ndim == 2:
+                    extend_positions = extend_positions[0]
+                ring_logical_positions = (
+                    extend_positions.flatten()[:total_ext_tokens]
+                    .to(sequence_lengths.device)
+                    .contiguous()
                 )
-                r_write, r_group_pos, r_seq_ids, _ = self._qsa_write_plan(
-                    token_slot_table=token_slot_table,
-                    start_blocks=ring_start_b,
-                    end_blocks=ring_end_b,
-                    capacity=int(sequence_lengths.numel()),
-                    compress_ratio=self.compress_ratio,
-                )
-                if r_write.numel() > 0:
-                    mixed_ring_write_locs = r_write.to(torch.int32)
-                    mixed_ring_group_locs = build_group_ring_slots(
-                        req_pool_indices=row_req_pool_indices,
-                        group_end_positions=r_group_pos.long(),
-                        sequence_ids=r_seq_ids.long(),
-                        compress_ratio=self.compress_ratio,
-                    ).to(torch.int32)
-        if not self.should_reuse_mtp_sparse_indices(forward_batch):
-            if decode_like:
-                pool = self.token_to_kv_pool
-                decode_page_table, decode_lengths = compressed_decode_view(
-                    compressed_page_size=pool.qsa_compressed_page_size,
-                    compress_ratio=pool.qsa_compress_ratio,
+                (
+                    token_to_batch_idx,
+                    write_locs,
+                    group_positions,
+                    group_sequence_ids,
+                    group_member_rows,
+                    pending_ring_slots,
+                    prefill_row_starts,
+                    prefill_row_ends,
+                    prefill_compressed_cu_seqlens,
+                    prefill_row_sequence_lengths,
+                    prefill_row_lengths,
+                    prefill_compress_group_locs,
+                    prefill_cu_seqlens_q,
+                ) = build_qsa_prefill_metadata_fused(
+                    extend_lens_cpu=ext_lens_list,
+                    seq_lens_cpu=seq_lens_list,
                     sequence_lengths=sequence_lengths,
+                    req_pool_indices=row_req_pool_indices,
                     token_slot_table=token_slot_table,
+                    logical_positions=ring_logical_positions,
+                    compress_ratio=ratio,
                 )
-            pending_ring_slots = build_pending_ring_slots(
-                token_to_batch_idx=token_to_batch_idx,
-                req_pool_indices=row_req_pool_indices,
-                sequence_lengths=sequence_lengths,
-                logical_positions=ring_logical_positions,
-                compress_ratio=self.compress_ratio,
-                is_extend=group_member_rows is not None,
-                prefix_lengths=extend_prefix_lens_for_ring,
-            )
-            if write_locs.numel():
-                write_locs_int32 = write_locs.to(torch.int32)
-                if group_member_rows is not None:
+                if write_locs.numel():
+                    write_locs_int32 = write_locs
                     rope_source = (
                         forward_batch.mrope_positions
                         if forward_batch.mrope_positions is not None
                         else forward_batch.positions
                     )
                     extend_rope_matrix = build_rope_position_matrix(
-                        rope_source, token_to_batch_idx.numel()
+                        rope_source, total_ext_tokens
                     )
-                    num_valid_tokens = token_to_batch_idx.numel()
-                    if num_valid_tokens > 0:
-                        member_rows = group_member_rows.long()
-                        prefill_compress_group_locs = (
-                            member_rows[:, None]
-                            + torch.arange(
-                                self.compress_ratio,
-                                device=member_rows.device,
-                                dtype=torch.long,
-                            )
-                        ).clamp_max(num_valid_tokens - 1).to(torch.int32)
-                else:
-                    compress_group_ring_locs = build_group_ring_slots(
-                        req_pool_indices=row_req_pool_indices,
-                        group_end_positions=group_positions.long(),
-                        sequence_ids=group_sequence_ids.long(),
+                used_fused_prefill_meta = True
+
+        if not used_fused_prefill_meta:
+            if not decode_like and token_to_batch_idx is None:
+                token_to_batch_idx = _extend_token_to_batch_idx(
+                    extend_seq_lens=forward_batch.extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    batch_size=batch_size,
+                    device=sequence_lengths.device,
+                )
+                # More mapped rows than physical would index past them;
+                # fewer is fine (DP MAX_LEN padding is trimmed downstream).
+                if token_to_batch_idx.numel() > num_position_tokens:
+                    raise ValueError(
+                        "QSA extend request mapping exceeds token rows: "
+                        f"mapping={token_to_batch_idx.numel()}, "
+                        f"positions={num_position_tokens}"
+                    )
+            write_locs, group_positions, group_sequence_ids, group_member_rows = (
+                self._qsa_build_write_plan(
+                    forward_batch=forward_batch,
+                    speculative_paged=speculative_paged,
+                    token_slot_table=token_slot_table,
+                    sequence_lengths=sequence_lengths,
+                )
+            )
+            extend_prefix_lens_for_ring = None
+            if decode_like:
+                decode_logical_positions = (
+                    logical_positions.to(torch.int32)
+                    if speculative_paged
+                    else sequence_lengths - 1
+                )
+                ring_logical_positions = decode_logical_positions
+            else:
+                extend_positions = forward_batch.positions
+                if extend_positions.ndim == 2:
+                    extend_positions = extend_positions[0]
+                ring_logical_positions = extend_positions.flatten()[
+                    : token_to_batch_idx.numel()
+                ]
+                has_unaligned_prefix = forward_batch.forward_mode.is_mixed()
+                extend_prefix_lens_cpu = getattr(
+                    forward_batch, "extend_prefix_lens_cpu", None
+                )
+                if not has_unaligned_prefix and extend_prefix_lens_cpu is not None:
+                    has_unaligned_prefix = any(
+                        int(p) % self.compress_ratio != 0
+                        for p in extend_prefix_lens_cpu[: sequence_lengths.numel()]
+                    )
+                if has_unaligned_prefix and forward_batch.extend_seq_lens is not None:
+                    ext_l = forward_batch.extend_seq_lens.long()[
+                        : sequence_lengths.numel()
+                    ]
+                    pref_l = (sequence_lengths.long() - ext_l).clamp_min(0)
+                    extend_prefix_lens_for_ring = pref_l
+                    end_b = sequence_lengths.long() // self.compress_ratio
+                    ring_start_b = pref_l // self.compress_ratio
+                    ring_end_b = torch.where(
+                        (pref_l % self.compress_ratio != 0) & (end_b > ring_start_b),
+                        ring_start_b + 1,
+                        ring_start_b,
+                    )
+                    r_write, r_group_pos, r_seq_ids, _ = self._qsa_write_plan(
+                        token_slot_table=token_slot_table,
+                        start_blocks=ring_start_b,
+                        end_blocks=ring_end_b,
+                        capacity=int(sequence_lengths.numel()),
                         compress_ratio=self.compress_ratio,
                     )
-            if not decode_like and token_to_batch_idx.numel() > 0:
-                (
-                    prefill_row_starts,
-                    prefill_row_ends,
-                    prefill_compressed_cu_seqlens,
-                ) = build_qsa_row_ranges(
-                    sequence_lengths,
-                    ring_logical_positions.to(sequence_lengths.device),
-                    token_to_batch_idx.to(sequence_lengths.device),
-                    self.compress_ratio,
+                    if r_write.numel() > 0:
+                        mixed_ring_write_locs = r_write.to(torch.int32)
+                        mixed_ring_group_locs = build_group_ring_slots(
+                            req_pool_indices=row_req_pool_indices,
+                            group_end_positions=r_group_pos.long(),
+                            sequence_ids=r_seq_ids.long(),
+                            compress_ratio=self.compress_ratio,
+                        ).to(torch.int32)
+            if not self.should_reuse_mtp_sparse_indices(forward_batch):
+                if decode_like:
+                    pool = self.token_to_kv_pool
+                    decode_page_table, decode_lengths = compressed_decode_view(
+                        compressed_page_size=pool.qsa_compressed_page_size,
+                        compress_ratio=pool.qsa_compress_ratio,
+                        sequence_lengths=sequence_lengths,
+                        token_slot_table=token_slot_table,
+                    )
+                pending_ring_slots = build_pending_ring_slots(
+                    token_to_batch_idx=token_to_batch_idx,
+                    req_pool_indices=row_req_pool_indices,
+                    sequence_lengths=sequence_lengths,
+                    logical_positions=ring_logical_positions,
+                    compress_ratio=self.compress_ratio,
+                    is_extend=group_member_rows is not None,
+                    prefix_lengths=extend_prefix_lens_for_ring,
                 )
-                prefill_row_sequence_lengths = sequence_lengths.index_select(
-                    0, token_to_batch_idx.long()
-                )
-                prefill_row_lengths = (prefill_row_ends - prefill_row_starts).to(
-                    dtype=torch.int32
-                )
+                if write_locs.numel():
+                    write_locs_int32 = write_locs.to(torch.int32)
+                    if group_member_rows is not None:
+                        rope_source = (
+                            forward_batch.mrope_positions
+                            if forward_batch.mrope_positions is not None
+                            else forward_batch.positions
+                        )
+                        extend_rope_matrix = build_rope_position_matrix(
+                            rope_source, token_to_batch_idx.numel()
+                        )
+                        num_valid_tokens = token_to_batch_idx.numel()
+                        if num_valid_tokens > 0:
+                            member_rows = group_member_rows.long()
+                            prefill_compress_group_locs = (
+                                member_rows[:, None]
+                                + torch.arange(
+                                    self.compress_ratio,
+                                    device=member_rows.device,
+                                    dtype=torch.long,
+                                )
+                            ).clamp_max(num_valid_tokens - 1).to(torch.int32)
+                    else:
+                        compress_group_ring_locs = build_group_ring_slots(
+                            req_pool_indices=row_req_pool_indices,
+                            group_end_positions=group_positions.long(),
+                            sequence_ids=group_sequence_ids.long(),
+                            compress_ratio=self.compress_ratio,
+                        )
+                if not decode_like and token_to_batch_idx.numel() > 0:
+                    (
+                        prefill_row_starts,
+                        prefill_row_ends,
+                        prefill_compressed_cu_seqlens,
+                    ) = build_qsa_row_ranges(
+                        sequence_lengths,
+                        ring_logical_positions.to(sequence_lengths.device),
+                        token_to_batch_idx.to(sequence_lengths.device),
+                        self.compress_ratio,
+                    )
+                    prefill_row_sequence_lengths = sequence_lengths.index_select(
+                        0, token_to_batch_idx.long()
+                    )
+                    prefill_row_lengths = (prefill_row_ends - prefill_row_starts).to(
+                        dtype=torch.int32
+                    )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -1010,6 +1096,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            prefill_cu_seqlens_q=prefill_cu_seqlens_q,
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1742,6 +1829,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    @staticmethod
+    def _apply_output_gate(
+        output: torch.Tensor, output_gate: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if output_gate is None:
+            return output
+        if output.is_cuda:
+            from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+            return fused_sigmoid_mul(output, output_gate, inplace=True)
+        gate = (
+            output_gate.reshape(output_gate.shape[0], -1)
+            if output_gate.ndim == 3
+            else output_gate
+        )
+        return output * torch.sigmoid(gate)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1751,6 +1855,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         save_kv_cache: bool = True,
         topk_indices: Optional[torch.Tensor] = None,
+        output_gate: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
@@ -1758,15 +1863,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         if getattr(
             forward_batch, "attn_cp_metadata", None
         ) is not None and is_cp_active(forward_batch):
-            return self._forward_extend_cp(
-                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            return self._apply_output_gate(
+                self._forward_extend_cp(
+                    q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+                ),
+                output_gate,
             )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
             )
             if fused_output is not None:
-                return fused_output
+                return self._apply_output_gate(fused_output, output_gate)
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1785,7 +1893,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
             )
-            return self._pad_extend_output(output, num_output_rows)
+            return self._apply_output_gate(
+                self._pad_extend_output(output, num_output_rows), output_gate
+            )
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -1801,7 +1911,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 slots,
                 layer.scaling,
             )
-            return self._pad_extend_output(output, num_output_rows)
+            return self._apply_output_gate(
+                self._pad_extend_output(output, num_output_rows), output_gate
+            )
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
@@ -1809,12 +1921,51 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(
-                0, dtype=torch.int32
-            ),
-            (1, 0),
-        ).contiguous()
+        metadata = self.forward_metadata
+        cached_cu_q = (
+            getattr(metadata, "prefill_cu_seqlens_q", None)
+            if metadata is not None
+            else None
+        )
+        if (
+            cached_cu_q is not None
+            and cached_cu_q.device == q.device
+            and cached_cu_q.dtype == torch.int32
+            and cached_cu_q.shape[0] == len(extend_lens) + 1
+        ):
+            cu_seqlens_q = cached_cu_q
+        else:
+            cu_seqlens_q = F.pad(
+                forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(
+                    0, dtype=torch.int32
+                ),
+                (1, 0),
+            ).contiguous()
+
+        # Write directly into the graph-captured attention output buffer when
+        # available so RadixAttention._eager_attention skips its memcpy128 copy.
+        out_tensor = None
+        out_buf = getattr(forward_batch, "_attn_output", None)
+        if (
+            out_buf is not None
+            and num_valid_rows == num_output_rows
+            and out_buf.shape[0] >= num_valid_rows
+            and out_buf.dtype == q.dtype
+            and out_buf.device == q.device
+            and out_buf.is_contiguous()
+            and out_buf[:num_valid_rows].numel()
+            == num_valid_rows * layer.tp_q_head_num * layer.head_dim
+        ):
+            out_tensor = out_buf[:num_valid_rows].view(
+                num_valid_rows, layer.tp_q_head_num, layer.head_dim
+            )
+        gate_valid = output_gate[:num_valid_rows] if output_gate is not None else None
+        extra_attn_kwargs = {}
+        if out_tensor is not None:
+            extra_attn_kwargs["out"] = out_tensor
+        if gate_valid is not None:
+            extra_attn_kwargs["output_gate"] = gate_valid
+
         if not any(prefix_lens):
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
@@ -1824,6 +1975,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 cu_seqlens_q,
                 layer.scaling,
+                **extra_attn_kwargs,
             )
             return self._pad_extend_output(output, num_output_rows)
 
@@ -1831,7 +1983,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         bs = len(extend_lens)
         max_q = max(extend_lens, default=1)
-        metadata = self.forward_metadata
         if (
             metadata is None
             and self.req_to_token is not None
@@ -1887,6 +2038,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lens_tensor,
                 layer.scaling,
                 max_q=max_q,
+                **extra_attn_kwargs,
             )
             return self._pad_extend_output(output, num_output_rows)
 
@@ -1919,6 +2071,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens_tensor,
             layer.scaling,
             max_q=max_q,
+            **extra_attn_kwargs,
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -2699,7 +2852,9 @@ def prewarm_qsa_prefill_kernels(
     from sglang.srt.layers.attention.qsa.kernel import gather_qsa_compressed_keys
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
+        can_use_triton_qsa_mqa_paged_prefill,
         qsa_mqa_prefill_relative,
+        triton_qsa_mqa_paged_prefill,
     )
     from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
     from sglang.srt.layers.attention.qsa.sparse_attn import _get_best_config
@@ -2768,11 +2923,13 @@ def prewarm_qsa_prefill_kernels(
             else torch.bfloat16
         )
         scale = head_dim**-0.5
-        # Warm non-prefix (_sparse_gqa_prefill) for BF16/FP16 configs.
+        # Warm non-prefix (_sparse_gqa_prefill) for BF16/FP16 configs
+        # (both ungated and fused-output-gate variants).
         for total_q in _unique_bucket_qs(is_fp8=False):
             q = torch.zeros(
                 (total_q, num_q_heads, head_dim), dtype=q_dtype, device=device
             )
+            gate = torch.zeros_like(q)
             indices = torch.full(
                 (total_q, final_topk), -1, dtype=torch.int32, device=device
             )
@@ -2785,9 +2942,12 @@ def prewarm_qsa_prefill_kernels(
             sparse_gqa_fwd_interface_triton(
                 q, k_flat, v_flat, 1, indices, cu_q_1, scale
             )
-            runs += 1
-        # Warm paged-prefix (_resolve_prefill_slots + _sparse_gqa_chunk_prefill)
-        # for real KV pool dtype/strides (int32 cu_q matching forward_extend).
+            sparse_gqa_fwd_interface_triton(
+                q, k_flat, v_flat, 1, indices, cu_q_1, scale, output_gate=gate
+            )
+            runs += 2
+        # Warm paged-prefix (_resolve_prefill_slots + _sparse_gqa_chunk_prefill /
+        # _sparse_gqa_chunk_prefill_fp8_pairs) for real KV pool dtype/strides.
         slot_table = torch.zeros((2, slot_width), dtype=slot_dtype, device=device)
         seq_lens = torch.ones((2,), dtype=torch.int32, device=device)
         cu_q_2 = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
@@ -2795,6 +2955,7 @@ def prewarm_qsa_prefill_kernels(
             q = torch.zeros(
                 (total_q, num_q_heads, head_dim), dtype=q_dtype, device=device
             )
+            gate = torch.zeros_like(q)
             indices = torch.full(
                 (total_q, final_topk), -1, dtype=torch.int32, device=device
             )
@@ -2810,9 +2971,23 @@ def prewarm_qsa_prefill_kernels(
                 scale,
                 max_q=1,
             )
-            runs += 1
+            sparse_gqa_paged_prefill_triton(
+                q,
+                k_pool,
+                v_pool,
+                slot_table,
+                indices,
+                cu_q_2,
+                seq_lens,
+                scale,
+                max_q=1,
+                output_gate=gate,
+            )
+            runs += 2
 
-    # Warm _gather_qsa_compressed_keys_kernel (do_not_specialize covers dynamic strides/counts).
+    # Warm _gather_qsa_compressed_keys_kernel (do_not_specialize covers dynamic strides/counts)
+    # and the fused QSA prefill metadata kernels (_qsa_prefill_token_meta_kernel /
+    # _qsa_prefill_write_plan_kernel).
     if attn_geoms and hasattr(pool, "get_qsa_compressed_k_buffer"):
         first_layer_id = next(iter(attn_geoms.values()))
         try:
@@ -2830,14 +3005,65 @@ def prewarm_qsa_prefill_kernels(
                 comp_buf, comp_slot_table, cu_blocks, 2, 2, pool.qsa_compress_ratio
             )
             runs += 1
+        meta_len = max(16, pool.qsa_compress_ratio * 4)
+        meta_slot_table = torch.zeros((2, meta_len), dtype=torch.int32, device=device)
+        meta_seq_lens = torch.tensor([meta_len, meta_len], dtype=torch.int32, device=device)
+        meta_req_idx = torch.tensor([1, 2], dtype=torch.int32, device=device)
+        meta_pos = torch.arange(meta_len, dtype=torch.int64, device=device).repeat(2)
+        build_qsa_prefill_metadata_fused(
+            extend_lens_cpu=[meta_len, meta_len],
+            seq_lens_cpu=[meta_len, meta_len],
+            sequence_lengths=meta_seq_lens,
+            req_pool_indices=meta_req_idx,
+            token_slot_table=meta_slot_table,
+            logical_positions=meta_pos,
+            compress_ratio=pool.qsa_compress_ratio,
+        )
+        runs += 1
+
+    indexer_geoms = {
+        (m.index_n_heads, m.index_head_dim, m.block_topk)
+        for m in model.modules()
+        if isinstance(m, QSAIndexer)
+    }
+    scoring_dtype = pool.qsa_compressed_dtype
+    if indexer_geoms and attn_geoms and hasattr(pool, "get_qsa_compressed_k_buffer"):
+        first_layer_id = next(iter(attn_geoms.values()))
+        try:
+            comp_buf = pool.get_qsa_compressed_k_buffer(first_layer_id)
+        except Exception:
+            comp_buf = None
+        if comp_buf is not None:
+            paged_slot_table = torch.zeros(
+                (1, max(16, pool.qsa_compress_ratio * 4)),
+                dtype=slot_dtype,
+                device=device,
+            )
+            for index_n_heads, index_head_dim, block_topk in indexer_geoms:
+                q_idx = torch.zeros(
+                    (32, index_n_heads, index_head_dim),
+                    dtype=scoring_dtype,
+                    device=device,
+                )
+                if can_use_triton_qsa_mqa_paged_prefill(
+                    q_idx, comp_buf, paged_slot_table
+                ):
+                    tok_batch = torch.zeros(32, dtype=torch.int32, device=device)
+                    row_lens = torch.ones(32, dtype=torch.int32, device=device)
+                    for min_len in (block_topk, 0):
+                        triton_qsa_mqa_paged_prefill(
+                            q_idx,
+                            comp_buf,
+                            paged_slot_table,
+                            tok_batch,
+                            row_lens,
+                            2,
+                            compress_ratio=pool.qsa_compress_ratio,
+                            min_scored_len=min_len,
+                        )
+                        runs += 1
 
     if HAS_TILELANG:
-        indexer_geoms = {
-            (m.index_n_heads, m.index_head_dim, m.block_topk)
-            for m in model.modules()
-            if isinstance(m, QSAIndexer)
-        }
-        scoring_dtype = pool.qsa_compressed_dtype
         for index_n_heads, index_head_dim, block_topk in indexer_geoms:
             k_comp = torch.zeros(
                 (64, 1, index_head_dim), dtype=scoring_dtype, device=device
