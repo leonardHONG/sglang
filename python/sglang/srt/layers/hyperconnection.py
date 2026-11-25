@@ -194,6 +194,8 @@ class GatedResidual(HyperConnectionBase):
         self._gate_stream = None
         self._fused_down_gate_weight = None
         self._fused_down_gate_weight_key = None
+        self._packed_up_weight = None
+        self._packed_up_weight_key = None
         self._jit_combine_logits_ok = False
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -294,14 +296,57 @@ class GatedResidual(HyperConnectionBase):
         )
         self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
 
+    def prepare_fused_weights(self) -> None:
+        """Eagerly allocate and populate derived HC weight views right after
+        weight loading (before any CUDA graph capture) without rebinding
+        ``nn.Parameter.data``."""
+        if (
+            self._jit_combine_logits_ok
+            and hasattr(self, "input_mix_weight_down")
+            and hasattr(self, "block_inject_weight")
+            and self.input_mix_weight_down.weight.is_cuda
+            and self.input_mix_weight_down.weight.dtype
+            == self.block_inject_weight.weight.dtype
+            and self.input_mix_weight_down.weight.dtype
+            in (torch.bfloat16, torch.float16)
+        ):
+            self._get_fused_down_gate_weight()
+        if (
+            getattr(self, "_jit_mix_prefill_ok", False)
+            and hasattr(self, "input_mix_weight_up")
+            and self.input_mix_weight_up.weight.is_cuda
+            and self.input_mix_weight_up.weight.dtype in (torch.bfloat16, torch.float16)
+        ):
+            self._get_packed_up_weight()
+
     def _get_fused_down_gate_weight(self) -> torch.Tensor:
         w_down = self.input_mix_weight_down.weight
         w_gate = self.block_inject_weight.weight
         key = weight_cache_key(w_down, w_gate)
-        if self._fused_down_gate_weight_key == key and self._fused_down_gate_weight is not None:
+        if (
+            self._fused_down_gate_weight_key == key
+            and self._fused_down_gate_weight is not None
+        ):
             return self._fused_down_gate_weight
-        total_out = w_down.shape[0] + w_gate.shape[0]
+        lowrank = w_down.shape[0]
+        total_out = lowrank + w_gate.shape[0]
         pad_rows = (-total_out) % 16
+        padded_out = total_out + pad_rows
+        existing = self._fused_down_gate_weight
+        if (
+            existing is not None
+            and existing.shape == (padded_out, w_down.shape[1])
+            and existing.dtype == w_down.dtype
+            and existing.device == w_down.device
+        ):
+            # Update in place so any previously captured CUDA graph keeps a valid pointer.
+            existing[:lowrank].copy_(w_down)
+            existing[lowrank:total_out].copy_(w_gate)
+            if pad_rows:
+                existing[total_out:].zero_()
+            if not torch.cuda.is_current_stream_capturing():
+                self._fused_down_gate_weight_key = key
+            return existing
         parts = [w_down, w_gate]
         if pad_rows:
             parts.append(w_down.new_zeros((pad_rows, w_down.shape[1])))
@@ -310,6 +355,33 @@ class GatedResidual(HyperConnectionBase):
             self._fused_down_gate_weight = fused
             self._fused_down_gate_weight_key = key
         return fused
+
+    def _get_packed_up_weight(self) -> torch.Tensor:
+        from sglang.kernels.ops.elementwise.hc_mix import (
+            pack_hc_up_weight,
+            pack_hc_up_weight_into,
+        )
+
+        w_up = self.input_mix_weight_up.weight
+        key = weight_cache_key(w_up, w_up)
+        if self._packed_up_weight_key == key and self._packed_up_weight is not None:
+            return self._packed_up_weight
+        existing = self._packed_up_weight
+        if (
+            existing is not None
+            and existing.shape == w_up.shape
+            and existing.dtype == w_up.dtype
+            and existing.device == w_up.device
+        ):
+            pack_hc_up_weight_into(w_up, existing, self.hc_count)
+            if not torch.cuda.is_current_stream_capturing():
+                self._packed_up_weight_key = key
+            return existing
+        packed = pack_hc_up_weight(w_up, self.hc_count)
+        if not torch.cuda.is_current_stream_capturing():
+            self._packed_up_weight = packed
+            self._packed_up_weight_key = key
+        return packed
 
     def _flydsl_mix_ok(self) -> bool:
         if self._mix_flydsl_ok is None:
@@ -429,6 +501,11 @@ class GatedResidual(HyperConnectionBase):
                 down_proj = F.linear(
                     hyper_input_normed, self.input_mix_weight_down.weight
                 )
+            w_up_packed = (
+                self._get_packed_up_weight()
+                if hyper_input_normed.shape[0] <= 512
+                else None
+            )
             mixed_input = hc_mix_up_gate(
                 hyper_input_normed,
                 down_proj,
@@ -436,6 +513,7 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
                 lowrank,
+                w_up_packed=w_up_packed,
             ).to(self.params_dtype)
         elif (
             self._jit_combine_logits_ok

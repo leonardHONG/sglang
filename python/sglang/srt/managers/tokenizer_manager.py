@@ -785,7 +785,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         else:
             self.mm_processor = self.processor = None
 

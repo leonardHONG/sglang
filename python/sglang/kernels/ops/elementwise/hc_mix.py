@@ -83,6 +83,35 @@ def _hc_gate_mix_kernel(
     tl.store(y_ptr + row * stride_y + offs_inner, acc, mask=mask)
 
 
+def pack_hc_up_weight(w_up: torch.Tensor, hc_count: int) -> torch.Tensor:
+    """Pack [HC * H, RANK] into [H * HC, RANK] (feature-major, branch-minor)
+    so every tile_h slice of _hc_mix_up_gate_kernel is 100% contiguous."""
+    total_out, lowrank = w_up.shape
+    hidden_size = total_out // hc_count
+    return (
+        w_up.detach()
+        .view(hc_count, hidden_size, lowrank)
+        .permute(1, 0, 2)
+        .reshape(total_out, lowrank)
+        .contiguous()
+    )
+
+
+def pack_hc_up_weight_into(
+    w_up: torch.Tensor, dst: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    """Refresh an existing packed up-weight buffer in place (CUDA-graph safe)."""
+    total_out, lowrank = w_up.shape
+    hidden_size = total_out // hc_count
+    dst.copy_(
+        w_up.detach()
+        .view(hc_count, hidden_size, lowrank)
+        .permute(1, 0, 2)
+        .reshape(total_out, lowrank)
+    )
+    return dst
+
+
 @triton.jit(do_not_specialize=["num_tokens"])
 def _hc_mix_up_gate_kernel(
     lowrank_ptr,
@@ -103,12 +132,16 @@ def _hc_mix_up_gate_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
+    PACKED_UP: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
 ):
     """Single-kernel fused HyperConnection silu + up-projection + sigmoid gate + mix.
 
     Optimal for decode / spec-verify token counts (M <= 512) where avoiding the
     [M, HC * HIDDEN] gate round-trip and extra kernel launches dominates.
+    When PACKED_UP is True, weight_ptr has [H, HC, RANK] layout so each tile's
+    BLOCK_N weight rows are contiguous and epilogue loads of xn_ptr are 4
+    coalesced [BLOCK_M, FEATS_PER_TILE] blocks with no tl.permute.
     """
     GROUP_M: tl.constexpr = 8
     FEATS_PER_TILE: tl.constexpr = BLOCK_N // HC
@@ -125,8 +158,11 @@ def _hc_mix_up_gate_kernel(
     rows = (tile_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     row_mask = rows < num_tokens
     cols = tl.arange(0, BLOCK_N)
-    features = tile_h * FEATS_PER_TILE + (cols % FEATS_PER_TILE)
-    gate_cols = (cols // FEATS_PER_TILE) * HIDDEN + features
+    if PACKED_UP:
+        w_rows = tile_h * BLOCK_N + cols
+    else:
+        features = tile_h * FEATS_PER_TILE + (cols % FEATS_PER_TILE)
+        w_rows = (cols // FEATS_PER_TILE) * HIDDEN + features
     k_offs = tl.arange(0, BLOCK_K)
 
     if LAUNCH_PDL:
@@ -144,7 +180,7 @@ def _hc_mix_up_gate_kernel(
         )
         w = tl.load(
             weight_ptr
-            + gate_cols[:, None] * stride_weight_n
+            + w_rows[:, None] * stride_weight_n
             + offset[None, :] * stride_weight_k,
         )
         if FUSE_SILU:
@@ -153,23 +189,41 @@ def _hc_mix_up_gate_kernel(
         acc = tl.dot(a, tl.trans(w), acc)
 
     gate = tl.sigmoid(acc.to(output_ptr.dtype.element_ty).to(tl.float32))
-    x = tl.load(
-        xn_ptr + rows[:, None] * stride_xn_m + gate_cols[None, :] * stride_xn_n,
-        mask=row_mask[:, None],
-        other=0.0,
-    ).to(tl.float32)
+    out_cols = tile_h * FEATS_PER_TILE + tl.arange(0, FEATS_PER_TILE)
 
-    gate = tl.permute(tl.reshape(gate, (BLOCK_M, HC, FEATS_PER_TILE)), (0, 2, 1))
-    x = tl.permute(tl.reshape(x, (BLOCK_M, HC, FEATS_PER_TILE)), (0, 2, 1))
-    g_even, g_odd = tl.split(tl.reshape(gate, (BLOCK_M, FEATS_PER_TILE, 2, 2)))
-    x_even, x_odd = tl.split(tl.reshape(x, (BLOCK_M, FEATS_PER_TILE, 2, 2)))
-    g0, g2 = tl.split(g_even)
-    g1, g3 = tl.split(g_odd)
-    x0, x2 = tl.split(x_even)
-    x1, x3 = tl.split(x_odd)
+    if PACKED_UP:
+        # gate has shape [BLOCK_M, FEATS_PER_TILE, HC=4] without permutation.
+        g_even, g_odd = tl.split(tl.reshape(gate, (BLOCK_M, FEATS_PER_TILE, 2, 2)))
+        g0, g2 = tl.split(g_even)
+        g1, g3 = tl.split(g_odd)
+        x_base = xn_ptr + rows[:, None] * stride_xn_m + out_cols[None, :] * stride_xn_n
+        x0 = tl.load(x_base, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        x1 = tl.load(
+            x_base + HIDDEN * stride_xn_n, mask=row_mask[:, None], other=0.0
+        ).to(tl.float32)
+        x2 = tl.load(
+            x_base + (2 * HIDDEN) * stride_xn_n, mask=row_mask[:, None], other=0.0
+        ).to(tl.float32)
+        x3 = tl.load(
+            x_base + (3 * HIDDEN) * stride_xn_n, mask=row_mask[:, None], other=0.0
+        ).to(tl.float32)
+    else:
+        x = tl.load(
+            xn_ptr + rows[:, None] * stride_xn_m + w_rows[None, :] * stride_xn_n,
+            mask=row_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.permute(tl.reshape(gate, (BLOCK_M, HC, FEATS_PER_TILE)), (0, 2, 1))
+        x = tl.permute(tl.reshape(x, (BLOCK_M, HC, FEATS_PER_TILE)), (0, 2, 1))
+        g_even, g_odd = tl.split(tl.reshape(gate, (BLOCK_M, FEATS_PER_TILE, 2, 2)))
+        x_even, x_odd = tl.split(tl.reshape(x, (BLOCK_M, FEATS_PER_TILE, 2, 2)))
+        g0, g2 = tl.split(g_even)
+        g1, g3 = tl.split(g_odd)
+        x0, x2 = tl.split(x_even)
+        x1, x3 = tl.split(x_odd)
+
     mixed = tl.fma(g3, x3, tl.fma(g2, x2, tl.fma(g1, x1, g0 * x0))) * (1.0 / HC)
 
-    out_cols = tile_h * FEATS_PER_TILE + tl.arange(0, FEATS_PER_TILE)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
     tl.store(
@@ -188,12 +242,13 @@ def hc_mix_up_gate(
     lowrank: int,
     out: Optional[torch.Tensor] = None,
     *,
+    w_up_packed: Optional[torch.Tensor] = None,
     fuse_silu: Optional[bool] = None,
-    block_m: int = 64,
-    block_n: int = 128,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
     block_k: Optional[int] = None,
-    num_warps: int = 4,
-    num_stages: int = 4,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused HyperConnection silu + up-projection + sigmoid gate + stream mix.
 
@@ -210,17 +265,6 @@ def hc_mix_up_gate(
         raise RuntimeError(f"Unsupported hc_count {hc_count}. Supported: 4")
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {x.dtype}. Supported: bfloat16, float16")
-    feats_per_tile = block_n // hc_count
-    if hidden_size <= 0 or hidden_size % feats_per_tile != 0:
-        raise RuntimeError(
-            f"Unsupported hidden_size {hidden_size}. Must be a multiple of {feats_per_tile}."
-        )
-    if block_k is None:
-        block_k = 32 if lowrank % 32 == 0 else 16
-    if lowrank <= 0 or lowrank % block_k != 0:
-        raise RuntimeError(
-            f"Unsupported lowrank {lowrank}. Must be a multiple of {block_k}."
-        )
 
     x_2d = x.reshape(-1, hc_count * hidden_size)
     down_2d = down_proj.reshape(-1, down_proj.shape[-1])
@@ -237,17 +281,41 @@ def hc_mix_up_gate(
         fuse_silu if fuse_silu is not None else (num_tokens <= _FUSED_UP_MAX_TOKENS)
     )
     if use_single_kernel:
+        # B300-measured tile defaults for packed w_up (H=2560, HC=4, LR=320):
+        # M=256 (c=64 verify): (64, 128, 64, 4, 4) = 22.8 us
+        # M=64/128/512: (128, 128, 64, 8, 4) = 22.0-27.4 us
+        if block_m is None:
+            block_m = 64 if 128 < num_tokens <= 256 else 128
+        if block_n is None:
+            block_n = 128
+        if block_k is None:
+            block_k = 64 if lowrank % 64 == 0 else (32 if lowrank % 32 == 0 else 16)
+        if num_warps is None:
+            num_warps = 4 if block_m == 64 else 8
+        if num_stages is None:
+            num_stages = 4
+        feats_per_tile = block_n // hc_count
+        if hidden_size <= 0 or hidden_size % feats_per_tile != 0:
+            raise RuntimeError(
+                f"Unsupported hidden_size {hidden_size}. Must be a multiple of {feats_per_tile}."
+            )
+        if lowrank <= 0 or lowrank % block_k != 0:
+            raise RuntimeError(
+                f"Unsupported lowrank {lowrank}. Must be a multiple of {block_k}."
+            )
+        use_packed = w_up_packed is not None
+        weight_arg = w_up_packed if use_packed else w_up
         grid = (triton.cdiv(num_tokens, block_m) * (hidden_size // feats_per_tile),)
         _hc_mix_up_gate_kernel[grid](
             down_2d,
-            w_up,
+            weight_arg,
             x_2d,
             out_2d,
             num_tokens,
             down_2d.stride(0),
             down_2d.stride(1),
-            w_up.stride(0),
-            w_up.stride(1),
+            weight_arg.stride(0),
+            weight_arg.stride(1),
             x_2d.stride(0),
             x_2d.stride(1),
             HIDDEN=hidden_size,
@@ -257,6 +325,7 @@ def hc_mix_up_gate(
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             FUSE_SILU=True,
+            PACKED_UP=use_packed,
             LAUNCH_PDL=launch_pdl,
             num_warps=num_warps,
             num_stages=num_stages,

@@ -21,14 +21,15 @@ def _small_copy_kernel(
     offsets = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     for i in tl.static_range(len(BIT_WIDTHS)):
         if field == i:
-            src_offset = (
-                offsets // cols[i] * source_strides[i][0]
-                + offsets % cols[i] * source_strides[i][1]
-            )
-            dst_offset = (
-                offsets // cols[i] * dest_strides[i][0]
-                + offsets % cols[i] * dest_strides[i][1]
-            )
+            # Decode 16*v + 3 values used to prevent Triton tuple-int specialization.
+            sz = sizes[i] >> 4
+            col = cols[i] >> 4
+            s0 = source_strides[i][0] >> 4
+            s1 = source_strides[i][1] >> 4
+            d0 = dest_strides[i][0] >> 4
+            d1 = dest_strides[i][1] >> 4
+            src_offset = offsets // col * s0 + offsets % col * s1
+            dst_offset = offsets // col * d0 + offsets % col * d1
             src = sources[i]
             dst = destinations[i]
             if BIT_WIDTHS[i] == 8:
@@ -43,8 +44,8 @@ def _small_copy_kernel(
             elif BIT_WIDTHS[i] == 64:
                 src = src.to(tl.pointer_type(tl.uint64))
                 dst = dst.to(tl.pointer_type(tl.uint64))
-            values = tl.load(src + src_offset, offsets < sizes[i], other=0)
-            tl.store(dst + dst_offset, values, offsets < sizes[i])
+            values = tl.load(src + src_offset, offsets < sz, other=0)
+            tl.store(dst + dst_offset, values, offsets < sz)
 
 
 def try_small_copy(dsts, srcs):
@@ -123,13 +124,18 @@ def try_small_copy(dsts, srcs):
                 return False
     largest = max(sizes)
     if largest:
+        # Triton keys a compiled kernel on every int inside a tuple argument
+        # (equal to 1, divisible by 16) even under do_not_specialize. Encoding
+        # 16 * v + 3 keeps every tuple int odd and never 1, preventing per-bs
+        # JIT recompiles during decode/verify batch-size transitions.
+        enc = lambda v: 16 * int(v) + 3
         _small_copy_kernel[(len(dsts), triton.cdiv(largest, 256))](
             tuple(srcs),
             tuple(dsts),
-            tuple(sizes),
-            tuple(cols),
-            tuple(src_strides),
-            tuple(dst_strides),
+            tuple(enc(v) for v in sizes),
+            tuple(enc(v) for v in cols),
+            tuple((enc(a), enc(b)) for a, b in src_strides),
+            tuple((enc(a), enc(b)) for a, b in dst_strides),
             tuple(bit_widths),
             BLOCK=256,
         )

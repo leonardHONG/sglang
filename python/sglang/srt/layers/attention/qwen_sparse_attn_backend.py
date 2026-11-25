@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    can_use_sparse_gqa_paged_decode_fp8,
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -45,6 +46,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
+    sparse_gqa_paged_decode_fp8_triton,
     sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -394,6 +396,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._trtllm_counters = {}
         self._flydsl_decode_workspace = None
+        self._fp8_decode_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
@@ -1870,11 +1873,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 output_gate,
             )
         if save_kv_cache:
-            fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
-            )
-            if fused_output is not None:
-                return self._apply_output_gate(fused_output, output_gate)
+            if not self._prefers_direct_fp8_decode(q, layer, forward_batch):
+                fused_output = self._try_fused_kv_attention(
+                    q, k, v, layer, forward_batch, topk_indices
+                )
+                if fused_output is not None:
+                    return self._apply_output_gate(fused_output, output_gate)
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1890,12 +1894,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
+            gate_valid = (
+                output_gate[:num_valid_rows] if output_gate is not None else None
+            )
             output = self._forward_paged_attention(
-                q, layer, forward_batch, topk_indices
+                q, layer, forward_batch, topk_indices, output_gate=gate_valid
             )
-            return self._apply_output_gate(
-                self._pad_extend_output(output, num_output_rows), output_gate
-            )
+            return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -2479,6 +2484,58 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         return self._flydsl_decode_workspace
 
+    def _get_fp8_decode_workspace(
+        self,
+        batch: int,
+        num_q_heads: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        max_splits = 16
+        capacity = max(batch, self._cuda_graph_max_tokens)
+        ws = self._fp8_decode_workspace
+        if (
+            ws is None
+            or ws[0].shape[0] < capacity
+            or ws[0].shape[1] != num_q_heads
+            or ws[0].shape[3] != head_dim
+            or ws[0].device != device
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._fp8_decode_workspace = (
+                torch.empty(
+                    (capacity, num_q_heads, max_splits, head_dim),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.empty(
+                    (capacity, num_q_heads, max_splits),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            ws = self._fp8_decode_workspace
+        return ws
+
+    def _prefers_direct_fp8_decode(self, q: torch.Tensor, layer, forward_batch) -> bool:
+        if _is_npu or is_hip() or not q.is_cuda or self._kv_shard_pool is not None:
+            return False
+        mode = getattr(forward_batch, "forward_mode", None)
+        if mode is None or not (
+            mode.is_decode() or self._is_speculative_paged_mode(mode)
+        ):
+            return False
+        pool = self.token_to_kv_pool
+        req_pool = self.req_to_token_pool
+        if pool is None or req_pool is None or req_pool.req_to_token is None:
+            return False
+        kv = pool.layer_router.read(layer.layer_id)
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        return can_use_sparse_gqa_paged_decode_fp8(
+            q_3d, kv.key(), kv.value(), req_pool.req_to_token
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2488,21 +2545,25 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         save_kv_cache: bool = True,
         topk_indices: Optional[torch.Tensor] = None,
+        output_gate: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
-            )
-            if fused_output is not None:
-                return fused_output
+            if not self._prefers_direct_fp8_decode(q, layer, forward_batch):
+                fused_output = self._try_fused_kv_attention(
+                    q, k, v, layer, forward_batch, topk_indices
+                )
+                if fused_output is not None:
+                    return self._apply_output_gate(fused_output, output_gate)
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+        return self._forward_paged_attention(
+            q, layer, forward_batch, topk_indices, output_gate=output_gate
+        )
 
     def _forward_paged_attention(
         self,
@@ -2510,11 +2571,64 @@ class QwenSparseAttnBackend(AttentionBackend):
         layer,
         forward_batch,
         topk_indices: torch.Tensor,
+        output_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
         k_buffer = pool.layer_router.read(layer.layer_id).key()
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
+
+        # Direct-read SM90+ FP8 int16-pair decode/verify path: reads scattered
+        # FP8 KV directly from the pool (eliminating _qsa_fused_kv_prepare +
+        # packed scratch writes), expands block indices inline, and fuses output_gate.
+        req_pool = self.req_to_token_pool
+        req_to_token = req_pool.req_to_token if req_pool is not None else None
+        if (
+            not _is_npu
+            and not is_hip()
+            and self._kv_shard_pool is None
+            and req_to_token is not None
+            and can_use_sparse_gqa_paged_decode_fp8(q, k_buffer, v_buffer, req_to_token)
+        ):
+            use_block = self._uses_block_indices(topk_indices)
+            qpos = (
+                metadata.indexer_metadata.decode_logical_positions
+                if use_block and metadata.indexer_metadata is not None
+                else None
+            )
+            if use_block and qpos is not None:
+                idx_arg = topk_indices.to(torch.int32).contiguous()
+                comp_ratio = self.compress_ratio
+            else:
+                idx_arg = self._expand_block_indices(topk_indices, metadata).to(
+                    torch.int32
+                ).contiguous()
+                comp_ratio = 1
+                qpos = None
+            row_reqs = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            )
+            ws = self._get_fp8_decode_workspace(
+                q.shape[0], q.shape[1], q.shape[2], q.device
+            )
+            output = sparse_gqa_paged_decode_fp8_triton(
+                q.contiguous(),
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                row_reqs,
+                idx_arg,
+                metadata.sequence_lengths[: q.shape[0]],
+                layer.scaling,
+                compress_ratio=comp_ratio,
+                query_positions=qpos,
+                output_gate=output_gate,
+                workspace=ws,
+            )
+            return output.reshape(q.shape[0], -1)
+
         topk_indices = self._expand_block_indices(topk_indices, metadata)
         if _is_npu or not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -2523,12 +2637,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             else:
                 attention = qsa_sparse_attention
             output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
-            return output.reshape(q.shape[0], -1)
+            return self._apply_output_gate(output.reshape(q.shape[0], -1), output_gate)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
-            return self._forward_trtllm_sparse(
+            output = self._forward_trtllm_sparse(
                 q,
                 k_buffer,
                 v_buffer,
@@ -2538,12 +2652,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 trtllm_decode,
             )
+            return self._apply_output_gate(output, output_gate)
 
         flydsl_decode = _resolve_flydsl_sparse_decode()
         if flydsl_decode is not None and flydsl_decode.can_use_flydsl_qsa_sparse_decode(
             q, k_buffer, v_buffer
         ):
-            return self._forward_flydsl_fused_sparse(
+            output = self._forward_flydsl_fused_sparse(
                 flydsl_decode,
                 q,
                 k_buffer,
@@ -2553,6 +2668,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
             )
+            return self._apply_output_gate(output, output_gate)
 
         batch, topk = topk_indices.shape
         sequence_lens = metadata.sequence_lengths
@@ -2620,7 +2736,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 valid_counts,
                 layer.scaling,
             )
-            return output.reshape(q.shape[0], -1)
+            return self._apply_output_gate(
+                output.reshape(q.shape[0], -1), output_gate
+            )
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         output = flash_attn_varlen_func(
@@ -2634,7 +2752,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             causal=True,
         )
-        return output.reshape(q.shape[0], -1)
+        return self._apply_output_gate(output.reshape(q.shape[0], -1), output_gate)
 
 
 class QwenSparseMultiStepDraftBackend:
@@ -2852,8 +2970,10 @@ def prewarm_qsa_prefill_kernels(
     from sglang.srt.layers.attention.qsa.kernel import gather_qsa_compressed_keys
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
+        can_use_triton_qsa_mqa_paged_decode,
         can_use_triton_qsa_mqa_paged_prefill,
         qsa_mqa_prefill_relative,
+        triton_qsa_mqa_paged_decode,
         triton_qsa_mqa_paged_prefill,
     )
     from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
@@ -2984,6 +3104,40 @@ def prewarm_qsa_prefill_kernels(
                 output_gate=gate,
             )
             runs += 2
+        # Warm direct-read FP8 decode/verify kernel across split-K levels so
+        # decode/verify batch-size transitions incur zero Triton compiles.
+        if can_use_sparse_gqa_paged_decode_fp8(
+            torch.empty((1, num_q_heads, head_dim), dtype=q_dtype, device=device),
+            k_pool,
+            v_pool,
+            slot_table,
+        ):
+            q_dec = torch.zeros((2, num_q_heads, head_dim), dtype=q_dtype, device=device)
+            gate_dec = torch.zeros_like(q_dec)
+            req_idx_dec = torch.zeros((2,), dtype=torch.int32, device=device)
+            seq_dec = torch.ones((2,), dtype=torch.int32, device=device)
+            qpos_dec = torch.zeros((2,), dtype=torch.int32, device=device)
+            blk_idx_dec = torch.zeros(
+                (2, pool.qsa_token_topk // pool.qsa_compress_ratio),
+                dtype=torch.int32,
+                device=device,
+            )
+            for splits in (1, 2, 4):
+                sparse_gqa_paged_decode_fp8_triton(
+                    q_dec,
+                    k_pool,
+                    v_pool,
+                    slot_table,
+                    req_idx_dec,
+                    blk_idx_dec,
+                    seq_dec,
+                    scale,
+                    compress_ratio=pool.qsa_compress_ratio,
+                    query_positions=qpos_dec,
+                    output_gate=gate_dec,
+                    num_splits=splits,
+                )
+                runs += 1
 
     # Warm _gather_qsa_compressed_keys_kernel (do_not_specialize covers dynamic strides/counts)
     # and the fused QSA prefill metadata kernels (_qsa_prefill_token_meta_kernel /
@@ -3062,13 +3216,66 @@ def prewarm_qsa_prefill_kernels(
                             min_scored_len=min_len,
                         )
                         runs += 1
+                # Also warm Triton paged decode MQA (both raw and 8-padded head counts).
+                comp_page_size = pool.qsa_compressed_page_size
+                if comp_buf.shape[0] >= comp_page_size:
+                    k_cache_4d = comp_buf[:comp_page_size].view(
+                        1, comp_page_size, 1, index_head_dim
+                    )
+                    pt_dec = torch.zeros((2, 1), dtype=torch.int32, device=device)
+                    ctx_dec = torch.ones((2,), dtype=torch.int32, device=device)
+                    for qh in {index_n_heads, ((index_n_heads + 7) // 8) * 8}:
+                        q_dec_idx = torch.zeros(
+                            (2, qh, index_head_dim),
+                            dtype=scoring_dtype,
+                            device=device,
+                        )
+                        if can_use_triton_qsa_mqa_paged_decode(
+                            q_dec_idx, k_cache_4d, pt_dec
+                        ):
+                            for bk in (64, 128):
+                                for min_len in (block_topk, 0):
+                                    triton_qsa_mqa_paged_decode(
+                                        q_dec_idx,
+                                        k_cache_4d,
+                                        pt_dec,
+                                        ctx_dec,
+                                        comp_page_size,
+                                        min_scored_len=min_len,
+                                        block_k=bk,
+                                    )
+                                    runs += 1
 
     if HAS_TILELANG:
+        from sglang.srt.layers.attention.qsa.mqa import (
+            _PREFILL_KEY_SPLIT_LEVELS,
+            _num_sms,
+            _prefill_key_splits,
+        )
+
+        num_sms = _num_sms(device.index or 0)
         for index_n_heads, index_head_dim, block_topk in indexer_geoms:
+            block_q = max(1, 128 // index_n_heads)
+            block_n = 64
+            # Derive minimal (rows, width) pairs that cover every reachable
+            # key_splits specialization on this GPU's SM count.
+            split_targets: dict[int, tuple[int, int]] = {}
+            max_width = max(block_n * _PREFILL_KEY_SPLIT_LEVELS[-1], 2048)
+            for row_blocks in range(1, 2 * num_sms + 2):
+                ks = _prefill_key_splits(row_blocks, max_width, block_n, device)
+                if ks not in split_targets:
+                    width = max(block_n * ks, 64)
+                    # Verify width keeps the same key_splits.
+                    if _prefill_key_splits(row_blocks, width, block_n, device) == ks:
+                        split_targets[ks] = (row_blocks * block_q, width)
+                    else:
+                        split_targets[ks] = (row_blocks * block_q, max_width)
+                if len(split_targets) == len(_PREFILL_KEY_SPLIT_LEVELS):
+                    break
             k_comp = torch.zeros(
                 (64, 1, index_head_dim), dtype=scoring_dtype, device=device
             )
-            for rows, width in ((128, 2048), (4096, 2048)):
+            for rows, width in split_targets.values():
                 q_idx = torch.zeros(
                     (rows, index_n_heads, index_head_dim),
                     dtype=scoring_dtype,

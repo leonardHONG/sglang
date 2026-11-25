@@ -155,4 +155,19 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
-__all__ = ["SmallFieldCopyPlan"]
+def try_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    """Stateless one-launch CUDA copy for small fields without Triton recompiles."""
+    if len(dsts) < 2 or len(dsts) != len(srcs) or len(dsts) > _MAX_FIELDS:
+        return False
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return False
+    for dst in dsts:
+        if dst.numel() > 8192:
+            return False
+    desc = _describe(dsts, srcs, allow_pinned_src=False)
+    if desc is None:
+        return False
+    return _run_host_desc(dsts[0], torch.tensor(desc, dtype=torch.int64))
+
+
+__all__ = ["SmallFieldCopyPlan", "try_small_field_copy"]

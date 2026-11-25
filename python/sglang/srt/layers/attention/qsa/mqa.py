@@ -967,6 +967,215 @@ def triton_qsa_mqa_paged_prefill(
     return logits
 
 
+if HAS_TRITON:
+
+    @triton.jit(
+        do_not_specialize=[
+            "batch",
+            "max_pages",
+            "max_model_len",
+            "pt_stride",
+            "sl_m",
+            "min_scored_len",
+        ]
+    )
+    def _qsa_mqa_paged_decode_kernel(
+        q_ptr,
+        k_cache_ptr,
+        page_table_ptr,
+        context_lens_ptr,
+        logits_ptr,
+        batch,
+        max_pages,
+        max_model_len,
+        pt_stride,
+        sl_m,
+        inv_scale,
+        min_scored_len,
+        HEADS: tl.constexpr,
+        HEADS_PAD: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        STAGES: tl.constexpr,
+        MASK_TAIL: tl.constexpr,
+    ):
+        """Pipelined SM90+ Triton paged decode MQA over compressed-K pages.
+
+        Grid is ``(batch, ctas_per_row)`` where ``ctas_per_row`` is read via
+        ``tl.num_programs(1)`` so a single compiled kernel serves all batch sizes.
+        """
+        row = tl.program_id(0)
+        cta = tl.program_id(1)
+        ctas_per_row = tl.num_programs(1)
+        if row >= batch:
+            return
+
+        ctx_len = tl.load(context_lens_ptr + row).to(tl.int32)
+        if ctx_len <= min_scored_len:
+            return
+
+        num_tiles = tl.cdiv(tl.minimum(ctx_len, max_model_len), BLOCK_K)
+        tiles_per_cta = tl.cdiv(num_tiles, ctas_per_row)
+        tile_start = cta * tiles_per_cta
+        tile_end = tl.minimum(tile_start + tiles_per_cta, num_tiles)
+        if tile_start >= tile_end:
+            return
+
+        d_offs = tl.arange(0, HEAD_DIM)
+        h_offs = tl.arange(0, HEADS_PAD)
+        h_valid = h_offs < HEADS
+        q_row_ptr = q_ptr + row.to(tl.int64) * (HEADS * HEAD_DIM)
+        # Load transposed [HEAD_DIM, HEADS_PAD] once per CTA.
+        q_tile = tl.load(
+            q_row_ptr + h_offs[None, :].to(tl.int64) * HEAD_DIM + d_offs[:, None],
+            mask=h_valid[None, :],
+            other=0.0,
+        )
+
+        pt_row_ptr = page_table_ptr + row.to(tl.int64) * pt_stride
+        logits_row_ptr = logits_ptr + row.to(tl.int64) * sl_m
+        k_col_offs = tl.arange(0, BLOCK_K)
+
+        for tile in tl.range(tile_start, tile_end, num_stages=STAGES):
+            k_offs = tile * BLOCK_K + k_col_offs
+            valid_k = (k_offs < ctx_len) & (k_offs < max_model_len)
+            pg_idx = k_offs // PAGE_SIZE
+            in_pg = k_offs % PAGE_SIZE
+            pg_valid = valid_k & (pg_idx < max_pages)
+            phys_pg = tl.load(pt_row_ptr + pg_idx, mask=pg_valid, other=0).to(tl.int64)
+            k_slots = tl.maximum(phys_pg, 0) * PAGE_SIZE + in_pg.to(tl.int64)
+            k_tile = tl.load(
+                k_cache_ptr + k_slots[:, None] * HEAD_DIM + d_offs[None, :],
+                mask=pg_valid[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+            scores = tl.dot(k_tile, q_tile, out_dtype=tl.float32)
+            # Padded head columns in q_tile are zero, so relu(0) == 0.
+            reduced = tl.sum(tl.maximum(scores, 0.0), axis=1) * inv_scale
+            if MASK_TAIL:
+                reduced = tl.where(valid_k, reduced, -float("inf"))
+                tl.store(
+                    logits_row_ptr + k_offs, reduced, mask=k_offs < max_model_len
+                )
+            else:
+                tl.store(logits_row_ptr + k_offs, reduced, mask=valid_k)
+
+
+def can_use_triton_qsa_mqa_paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+) -> bool:
+    if (
+        not HAS_TRITON
+        or _is_npu
+        or is_hip()
+        or not q.is_cuda
+        or not k_cache.is_cuda
+        or not page_table.is_cuda
+    ):
+        return False
+    if torch.cuda.get_device_capability(q.device) < (9, 0):
+        return False
+    if q.dtype != k_cache.dtype or q.dtype not in (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+    ):
+        return False
+    if (
+        k_cache.ndim != 4
+        or k_cache.shape[2] != 1
+        or not k_cache.is_contiguous()
+        or page_table.stride(-1) != 1
+    ):
+        return False
+    heads, head_dim = q.shape[1], q.shape[2]
+    page_size = k_cache.shape[1]
+    return (
+        heads > 0
+        and head_dim >= 32
+        and (head_dim & (head_dim - 1)) == 0
+        and k_cache.shape[3] == head_dim
+        and page_size > 0
+        and (page_size & (page_size - 1)) == 0
+    )
+
+
+def triton_qsa_mqa_paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
+    block_k: Optional[int] = None,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    ctas_per_row: Optional[int] = None,
+) -> torch.Tensor:
+    """Fast SM90+ pipelined Triton paged decode MQA over compressed-K pages."""
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    batch, heads, head_dim = q.shape
+    page_size = int(k_cache.shape[1])
+    if min_scored_len > 0:
+        logits = torch.empty(
+            (batch, max_model_len), dtype=torch.float32, device=q.device
+        )
+        mask_tail = False
+    else:
+        logits = torch.full(
+            (batch, max_model_len), -float("inf"), dtype=torch.float32, device=q.device
+        )
+        mask_tail = True
+    if batch == 0 or max_model_len == 0:
+        return logits
+
+    q_contig = q.contiguous()
+    ctx_i32 = context_lens.to(device=q.device, dtype=torch.int32).contiguous()
+    heads_pad = max(16, triton.next_power_of_2(heads))
+    inv_scale = 1.0 / float(score_scale or math.sqrt(head_dim))
+    # B300-measured decode/verify winners:
+    # - batch >= 128 (M=256 verify): BLOCK_K=128, ctas_per_row=2 -> 18.8 us (1.79x vs TileLang)
+    # - batch < 128 (M=64 draft): BLOCK_K=64, ctas_per_row=4 -> 18.9 us
+    bk = block_k if block_k is not None else (128 if batch >= 128 else 64)
+    if ctas_per_row is None:
+        if batch >= 128:
+            ctas_per_row = 2
+        elif batch >= 32:
+            ctas_per_row = 4
+        else:
+            ctas_per_row = 8
+
+    _qsa_mqa_paged_decode_kernel[(batch, ctas_per_row)](
+        q_contig,
+        k_cache,
+        page_table,
+        ctx_i32,
+        logits,
+        batch,
+        page_table.shape[1],
+        max_model_len,
+        page_table.stride(0),
+        logits.stride(0),
+        inv_scale,
+        min_scored_len,
+        HEADS=heads,
+        HEADS_PAD=heads_pad,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=page_size,
+        BLOCK_K=bk,
+        STAGES=num_stages,
+        MASK_TAIL=mask_tail,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return logits
+
+
 def qsa_mqa_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1020,6 +1229,16 @@ def qsa_mqa_decode(
         from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
 
         return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
+    if can_use_triton_qsa_mqa_paged_decode(q, k_cache, page_table):
+        return triton_qsa_mqa_paged_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,
@@ -1038,6 +1257,7 @@ def qsa_mqa_decode(
 __all__ = [
     "HAS_TILELANG",
     "HAS_TRITON",
+    "can_use_triton_qsa_mqa_paged_decode",
     "can_use_triton_qsa_mqa_paged_prefill",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
@@ -1048,5 +1268,6 @@ __all__ = [
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
     "torch_qsa_mqa_prefill_relative",
+    "triton_qsa_mqa_paged_decode",
     "triton_qsa_mqa_paged_prefill",
 ]

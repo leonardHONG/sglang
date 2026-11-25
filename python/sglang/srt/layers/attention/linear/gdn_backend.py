@@ -779,45 +779,52 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 has_init = torch.zeros((1,), dtype=torch.bool, device=device)
                 cache_idx = torch.ones((1,), dtype=state_indices_dtype, device=device)
                 # Warm both cu_seqlen % 16 == 0 and != 0 (Triton divisibility
-                # specialization) and both block_table=None / non-None.
-                for seq_len in (64, 65):
-                    mixed_tmp = torch.zeros(
-                        (seq_len, qkv_dim), dtype=io_dtype, device=device
-                    )
-                    cu_q = torch.tensor(
-                        [0, seq_len], dtype=torch.int32, device=device
-                    )
-                    causal_conv1d_fn(
-                        mixed_tmp.transpose(0, 1),
-                        layer.conv_weights,
-                        layer.bias,
-                        activation=layer.activation,
-                        conv_states=conv_states_tmp,
-                        has_initial_state=has_init,
-                        cache_indices=cache_idx,
-                        query_start_loc=cu_q,
-                        seq_lens_cpu=[seq_len],
-                    )
-                    num_blocks = (
-                        seq_len + CAUSAL_CONV1D_FWD_BLOCK_M - 1
-                    ) // CAUSAL_CONV1D_FWD_BLOCK_M
-                    block_table = torch.tensor(
-                        [[0, b] for b in range(num_blocks)],
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    causal_conv1d_fn(
-                        mixed_tmp.transpose(0, 1),
-                        layer.conv_weights,
-                        layer.bias,
-                        activation=layer.activation,
-                        conv_states=conv_states_tmp,
-                        has_initial_state=has_init,
-                        cache_indices=cache_idx,
-                        query_start_loc=cu_q,
-                        seq_lens_cpu=[seq_len],
-                        block_table=block_table,
-                    )
+                # specialization), both contiguous and QKVZ-sliced input views
+                # (stride_x_seq = qkv_dim vs qkv_dim + v_dim is a Triton
+                # compile-time constant), and both block_table=None / non-None.
+                row_widths = [qkv_dim]
+                if getattr(layer, "v_dim", 0) > 0:
+                    row_widths.append(qkv_dim + layer.v_dim)
+                for row_width in row_widths:
+                    for seq_len in (64, 65):
+                        buf_tmp = torch.zeros(
+                            (seq_len, row_width), dtype=io_dtype, device=device
+                        )
+                        mixed_tmp = buf_tmp[:, :qkv_dim]
+                        cu_q = torch.tensor(
+                            [0, seq_len], dtype=torch.int32, device=device
+                        )
+                        causal_conv1d_fn(
+                            mixed_tmp.transpose(0, 1),
+                            layer.conv_weights,
+                            layer.bias,
+                            activation=layer.activation,
+                            conv_states=conv_states_tmp,
+                            has_initial_state=has_init,
+                            cache_indices=cache_idx,
+                            query_start_loc=cu_q,
+                            seq_lens_cpu=[seq_len],
+                        )
+                        num_blocks = (
+                            seq_len + CAUSAL_CONV1D_FWD_BLOCK_M - 1
+                        ) // CAUSAL_CONV1D_FWD_BLOCK_M
+                        block_table = torch.tensor(
+                            [[0, b] for b in range(num_blocks)],
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        causal_conv1d_fn(
+                            mixed_tmp.transpose(0, 1),
+                            layer.conv_weights,
+                            layer.bias,
+                            activation=layer.activation,
+                            conv_states=conv_states_tmp,
+                            has_initial_state=has_init,
+                            cache_indices=cache_idx,
+                            query_start_loc=cu_q,
+                            seq_lens_cpu=[seq_len],
+                            block_table=block_table,
+                        )
             if (is_cuda() or _is_hip) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
                 prep_key = (
                     layer.num_q_heads,

@@ -18,7 +18,10 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["bs", "num_tokens", "num_padding"],
+    do_not_specialize_on_alignment=["bs", "num_tokens", "num_padding"],
+)
 def _qsa_graph_layout_kernel(
     # Request-level inputs.
     seq_lens_ptr,  # [bs] base lengths
@@ -66,7 +69,24 @@ def _qsa_graph_layout_kernel(
         tl.store(row_req_pool_ptr + row, req.to(tl.int32))
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "req_to_token_row_stride",
+        "max_pages",
+        "bs",
+        "num_padding",
+        "extend_len",
+        "seq_offset",
+    ],
+    do_not_specialize_on_alignment=[
+        "req_to_token_row_stride",
+        "max_pages",
+        "bs",
+        "num_padding",
+        "extend_len",
+        "seq_offset",
+    ],
+)
 def _qsa_graph_row_metadata_kernel(
     # Row layout buffers (filled by the layout kernel).
     row_seq_lens_ptr,
@@ -176,16 +196,68 @@ def launch_graph_metadata(
     row_seq_lens = metadata.sequence_lengths
     row_req_pool = metadata.row_req_pool_indices
     row_prefix_lens = indexer.graph_prefix_lengths
+    ext_arg = extend_lens if extend_lens is not None else row_seq_lens
+
+    from sglang.kernels.ops.attention.qsa_graph_metadata import (
+        can_use_jit_qsa_graph_metadata,
+        run_jit_qsa_graph_metadata,
+    )
+
+    if (
+        can_use_jit_qsa_graph_metadata(row_seq_lens.device)
+        and row_seq_lens.dtype == torch.int32
+        and row_req_pool.dtype == torch.int32
+        and row_prefix_lens.dtype == torch.int32
+        and indexer.graph_compressed_lengths.dtype == torch.int32
+        and indexer.graph_write_locs.dtype == torch.int32
+        and indexer.graph_compressed_page_table.dtype == torch.int32
+        and indexer.decode_logical_positions.dtype == torch.int32
+        and indexer.pending_ring_slots.dtype == torch.int64
+        and indexer.graph_ring_group_locs.dtype == torch.int32
+        and row_seq_lens.is_contiguous()
+        and row_req_pool.is_contiguous()
+        and row_prefix_lens.is_contiguous()
+        and indexer.graph_compressed_lengths.is_contiguous()
+        and indexer.graph_write_locs.is_contiguous()
+        and indexer.graph_compressed_page_table.is_contiguous()
+        and indexer.decode_logical_positions.is_contiguous()
+        and indexer.pending_ring_slots.is_contiguous()
+        and indexer.graph_ring_group_locs.is_contiguous()
+        and seq_lens.is_contiguous()
+        and req_pool_indices.is_contiguous()
+        and ext_arg.is_contiguous()
+        and req_to_token.stride(-1) == 1
+    ):
+        run_jit_qsa_graph_metadata(
+            row_seq_lens=row_seq_lens,
+            row_req_pool=row_req_pool,
+            row_prefix_lens=row_prefix_lens,
+            compressed_lens=indexer.graph_compressed_lengths,
+            write_locs=indexer.graph_write_locs,
+            page_table=indexer.graph_compressed_page_table,
+            logical_positions=indexer.decode_logical_positions,
+            state_slots=indexer.pending_ring_slots,
+            ring_locs=indexer.graph_ring_group_locs,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            req_pool=req_pool_indices,
+            extend_lens=ext_arg,
+            mode=mode,
+            bs=bs,
+            num_rows=num_rows,
+            num_padding=num_padding,
+            extend_len=extend_len,
+            seq_offset=seq_offset,
+            ratio=indexer.compress_ratio,
+            full_page=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        )
+        return
 
     if mode == 2:
         _qsa_graph_layout_kernel[(bs + 1,)](
             seq_lens,
             req_pool_indices,
-            (
-                extend_lens
-                if extend_lens is not None
-                else row_seq_lens  # unused dummy pointer
-            ),
+            ext_arg,
             row_seq_lens,
             row_prefix_lens,
             row_req_pool,
@@ -221,7 +293,10 @@ def launch_graph_metadata(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["row_stride", "bs", "num_padding"],
+    do_not_specialize_on_alignment=["row_stride", "bs", "num_padding"],
+)
 def _qsa_draft_graph_metadata_kernel(
     buffers,
     seq_lens,
@@ -264,6 +339,11 @@ def _qsa_draft_graph_metadata_kernel(
 
 
 def prepare_draft_graph_metadata(metadata, req_to_token, pool):
+    from sglang.kernels.ops.attention.qsa_graph_metadata import (
+        can_use_jit_qsa_graph_metadata,
+        pack_draft_step_ptrs_host,
+    )
+
     buffers = tuple(
         (
             m.sequence_lengths,
@@ -278,6 +358,11 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         )
         for m in metadata
     )
+    step_ptrs_host = (
+        pack_draft_step_ptrs_host(buffers)
+        if can_use_jit_qsa_graph_metadata(req_to_token.device)
+        else None
+    )
     return (
         buffers,
         req_to_token,
@@ -285,12 +370,40 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
         pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+        step_ptrs_host,
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    if len(args) == 7:
+        buffers, req_to_token, row_stride, max_pages, ratio, full_page, step_ptrs_host = args
+    else:
+        buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+        step_ptrs_host = None
     if bs == 0:
+        return
+    clamped_pad = max(0, min(int(num_padding or 0), bs))
+    if (
+        step_ptrs_host is not None
+        and seq_lens.is_contiguous()
+        and req_pool_indices.is_contiguous()
+        and req_to_token.stride(-1) == 1
+    ):
+        from sglang.kernels.ops.attention.qsa_graph_metadata import (
+            run_jit_qsa_draft_graph_metadata,
+        )
+
+        run_jit_qsa_draft_graph_metadata(
+            step_ptrs_host=step_ptrs_host,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            req_pool=req_pool_indices,
+            bs=bs,
+            num_padding=clamped_pad,
+            max_pages=max_pages,
+            ratio=ratio,
+            full_page=full_page,
+        )
         return
     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
         buffers,
@@ -299,7 +412,7 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         req_to_token,
         row_stride,
         bs,
-        max(0, min(int(num_padding or 0), bs)),
+        clamped_pad,
         max_pages,
         ratio,
         full_page,

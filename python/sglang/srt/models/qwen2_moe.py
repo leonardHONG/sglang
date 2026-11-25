@@ -794,10 +794,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
+        # Only clone when routed experts may overwrite hidden_states in place;
+        # out-of-place runners (e.g., FlashInfer TRT-LLM NVFP4 / inplace=False)
+        # only read hidden_states concurrently with shared_expert.
+        moe_inplace = getattr(
+            getattr(self.experts, "moe_runner_config", None), "inplace", True
+        )
+        shared_input = hidden_states.clone() if moe_inplace else hidden_states
         shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
-            )
+            self._forward_shared_experts(shared_input, apply_gate=not use_fused_gate)
             if self.shared_expert is not None
             else None
         )

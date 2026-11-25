@@ -77,13 +77,34 @@ _ID_PRESERVING_POST_PROCESSORS = {
     "RobertaProcessing",
 }
 
-# Pre-token regex for which the intra-gap cut points below were verified.
+# Pre-token regexes for which the intra-gap cut points below were verified:
+# - Llama-3 / GLM style (\p{L}+, \p{N}{1,3})
+# - Qwen2 / Qwen3 style (\p{L}+, \p{N})
+# - Qwen3.5 / Qwen4-Exp style ([\p{L}\p{M}]+, \p{N}, with NFC normalizer)
 _INTRA_SPLIT_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
     r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
-# ASCII letters only: Python and Oniguruma agree on them for \p{L}.
-_INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
+_QWEN2_INTRA_SPLIT_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_QWEN35_INTRA_SPLIT_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_INTRA_SPLIT_REGEXES = frozenset(
+    {
+        _INTRA_SPLIT_REGEX,
+        _QWEN2_INTRA_SPLIT_REGEX,
+        _QWEN35_INTRA_SPLIT_REGEX,
+    }
+)
+# ASCII letters and CJK unified ideographs after \n are ccc=0 starters that
+# never compose across the cut under NFC and agree between Python and Oniguruma.
+_INTRA_CUT = re.compile(
+    r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z\u4e00-\u9fff])"
+)
 
 _plans = weakref.WeakKeyDictionary()
 _segment_encoders = weakref.WeakKeyDictionary()
@@ -126,17 +147,29 @@ def _post_processor_safe(cfg):
     return processor_type in _ID_PRESERVING_POST_PROCESSORS
 
 
-def _intra_cut_safe(cfg):
+def _intra_cut_safe(cfg, *, has_normalized_added: bool = False):
     pre = cfg.get("pre_tokenizer") or {}
     subs = pre.get("pretokenizers") if pre.get("type") == "Sequence" else None
     if not subs or len(subs) != 2:
         return False
     split, bl = subs
     model = cfg.get("model") or {}
+    norm = cfg.get("normalizer")
+    norm_ok = norm is None or (
+        isinstance(norm, dict)
+        and norm.get("type") == "NFC"
+        and not has_normalized_added
+    )
+    pattern = split.get("pattern")
+    regex_ok = (
+        isinstance(pattern, dict)
+        and len(pattern) == 1
+        and pattern.get("Regex") in _INTRA_SPLIT_REGEXES
+    )
     return (
-        cfg.get("normalizer") is None
+        norm_ok
         and split.get("type") == "Split"
-        and split.get("pattern") == {"Regex": _INTRA_SPLIT_REGEX}
+        and regex_ok
         and split.get("behavior") == "Isolated"
         and not split.get("invert")
         and bl.get("type") == "ByteLevel"
@@ -196,7 +229,11 @@ def _build_plan(tokenizer):
     # Without a normalizer that text is the original, so their ends are cut
     # points too; with one, only the first-pass (raw) tokens are used.
     npattern = _alternation(normed) if backend.normalizer is None else None
-    intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
+    intra = (
+        _INTRA_CUT
+        if _intra_cut_safe(cfg, has_normalized_added=bool(normed))
+        else None
+    )
     if pattern is None and npattern is None and intra is None:
         return None
     pp = backend.post_processor
@@ -288,7 +325,10 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     if len(chunks) < 2:
         return tokenizer.encode(text, **encode_kwargs)
 
-    check = _parallel_ok is None
+    check = (
+        _parallel_ok is None
+        and sum(1 for c in chunks if len(c) >= _MIN_CHUNK_CHARS) >= 2
+    )
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
     encodings = backend.encode_batch(chunks, add_special_tokens=False)

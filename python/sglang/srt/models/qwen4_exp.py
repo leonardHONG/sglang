@@ -2308,7 +2308,6 @@ class Qwen4ExpAttentionDecoderLayer(
             and gate is not None
             and hidden_states.is_cuda
             and not _is_npu
-            and forward_batch.forward_mode.is_extend_without_speculative()
             and not _shards_rows_over_cp(forward_batch)
         )
         if fuse_qsa_output_gate:
@@ -3116,6 +3115,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+            elif isinstance(module, GatedResidual):
+                module.prepare_fused_weights()
 
         return loaded_params
 
@@ -3124,6 +3125,34 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
+
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        """Autotune FlashInfer TRT-LLM NVFP4 MoE tactics up to the prefill
+        token ceiling without running a full-model extend dummy forward."""
+        seen = set()
+        for module in self.model.modules():
+            if not isinstance(module, Qwen2MoeSparseMoeBlock):
+                continue
+            experts = module.experts
+            w13 = getattr(experts, "w13_weight", None)
+            w2 = getattr(experts, "w2_weight", None)
+            if w13 is None or w2 is None or not w13.is_cuda:
+                continue
+            key = (w13.shape, w2.shape)
+            if key in seen:
+                continue
+            seen.add(key)
+            hidden_states = torch.randn(
+                (num_tokens, module.gate.weight.shape[1]),
+                dtype=dtype,
+                device=w13.device,
+            )
+            router_logits, _ = module.gate(hidden_states)
+            experts(hidden_states, module.topk(hidden_states, router_logits))
+            del hidden_states, router_logits
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+            return 0
+        return len(seen)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
