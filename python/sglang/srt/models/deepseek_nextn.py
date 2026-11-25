@@ -318,6 +318,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             return None
         return quant_config
 
+    def _should_preserve_modelopt_fp4_nextn(
+        self,
+        config: PretrainedConfig,
+        nextn_quant_config: Optional[QuantizationConfig],
+    ) -> bool:
+        del config, nextn_quant_config
+        return False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -331,12 +339,15 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
+        preserve_modelopt_fp4 = self._should_preserve_modelopt_fp4_nextn(
+            config, nextn_quant_config
+        )
 
         self.model = DeepseekModelNextN(
             config,
             nextn_quant_config,
             prefix=add_prefix("model", prefix),
-            preserve_modelopt_fp4=getattr(self, "_preserve_modelopt_fp4_nextn", False),
+            preserve_modelopt_fp4=preserve_modelopt_fp4,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

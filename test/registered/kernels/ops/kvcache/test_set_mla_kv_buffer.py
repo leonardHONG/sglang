@@ -5,11 +5,14 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    _set_mla_kv_buffer_impl,
+    set_mla_kv_buffer_cast_triton,
     set_mla_kv_buffer_naive,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
     can_use_set_mla_kv_buffer,
     set_mla_kv_buffer,
@@ -391,6 +394,128 @@ def test_set_mla_kv_buffer_naive_matches_triton(rope_dim):
     )
 
     torch.testing.assert_close(from_naive, reference, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("rope_dim", [0, TRITON_ROPE_DIM])
+@pytest.mark.parametrize("nope_dim", [512, 384])
+@pytest.mark.parametrize(
+    "paged,dcp_world_size,dcp_rank",
+    [
+        pytest.param(False, 1, 0, id="flat_dcp1"),
+        pytest.param(True, 1, 0, id="paged_dcp1"),
+        pytest.param(False, 2, 0, id="flat_dcp2_r0"),
+        pytest.param(False, 2, 1, id="flat_dcp2_r1"),
+    ],
+)
+def test_set_mla_kv_buffer_cast_triton_matches_cast_then_scatter(
+    nope_dim, rope_dim, paged, dcp_world_size, dcp_rank
+):
+    """Fused bf16->fp8 cast-on-write must match legacy .to(fp8) + scatter
+    byte-for-byte across NoPE/RoPE, paged/non-paged, and DCP=1/2."""
+    fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+    total_dim = nope_dim + rope_dim
+    # Include reserved slot 0, both DCP parities, and cross-page offsets.
+    loc = torch.tensor(
+        [0, 1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    n_loc = loc.numel()
+
+    gen = torch.Generator(device=DEVICE).manual_seed(20261126 + nope_dim + rope_dim)
+    cache_k_nope = torch.randn(
+        (n_loc, 1, nope_dim), dtype=torch.bfloat16, device=DEVICE, generator=gen
+    )
+    # Exercise boundary / saturation / subnormal values alongside random data.
+    cache_k_nope[1, 0, :6] = torch.tensor(
+        [0.0, -0.0, 448.0, -448.0, 500.0, -500.0],
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    cache_k_nope[0] = torch.nan  # skipped by reserved_skip_index=0
+
+    if rope_dim > 0:
+        cache_k_rope = torch.randn(
+            (n_loc, 1, rope_dim), dtype=torch.bfloat16, device=DEVICE, generator=gen
+        )
+        cache_k_rope[0] = torch.nan
+    else:
+        cache_k_rope = torch.empty((n_loc, 1, 0), dtype=torch.bfloat16, device=DEVICE)
+
+    if paged:
+        # Non-packed 4D paged layout: extra rows per page force
+        # stride(0) != page_size * stride(1) so paged_layout(kv) is active.
+        num_pages, page_size, pad_rows = 16, 16, 4
+        backing_got = torch.randint(
+            0,
+            256,
+            (num_pages, page_size + pad_rows, 1, total_dim),
+            dtype=torch.uint8,
+            device=DEVICE,
+            generator=gen,
+        )
+        backing_ref = backing_got.clone()
+        kv_got = backing_got[:, :page_size, :, :].view(fp8_dtype)
+        kv_ref = backing_ref[:, :page_size, :, :].view(fp8_dtype)
+        assert paged_layout(kv_got) is not None
+    else:
+        backing_got = torch.randint(
+            0,
+            256,
+            (CACHE_SIZE, 1, total_dim),
+            dtype=torch.uint8,
+            device=DEVICE,
+            generator=gen,
+        )
+        backing_ref = backing_got.clone()
+        kv_got = backing_got.view(fp8_dtype)
+        kv_ref = backing_ref.view(fp8_dtype)
+        assert paged_layout(kv_got) is None
+
+    set_mla_kv_buffer_cast_triton(
+        kv_got,
+        loc,
+        cache_k_nope,
+        cache_k_rope if rope_dim > 0 else None,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+    )
+
+    # Legacy reference: explicit .to(fp8) then view as store_dtype (uint8) and
+    # scatter, mirroring MLATokenToKVPool._write_mla_kv_buffer.
+    nope_fp8 = cache_k_nope.to(fp8_dtype).view(torch.uint8)
+    rope_fp8 = cache_k_rope.to(fp8_dtype).view(torch.uint8) if rope_dim > 0 else None
+    _set_mla_kv_buffer_impl(
+        kv_ref.view(torch.uint8),
+        loc,
+        nope_fp8,
+        rope_fp8,
+        reserved_skip_index=0,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+    )
+
+    assert torch.equal(backing_got, backing_ref)
+
+
+def test_set_mla_kv_buffer_cast_triton_paged_rejects_dcp():
+    """Paged layout holds rank-local rows, so paged + DCP>1 must assert."""
+    fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+    backing = torch.zeros((4, 20, 1, 512), dtype=torch.uint8, device=DEVICE)
+    kv = backing[:, :16, :, :].view(fp8_dtype)
+    assert paged_layout(kv) is not None
+    loc = torch.tensor([1, 2], dtype=torch.int64, device=DEVICE)
+    cache_k_nope = torch.zeros((2, 1, 512), dtype=torch.bfloat16, device=DEVICE)
+
+    with pytest.raises(AssertionError, match="rank-local rows"):
+        set_mla_kv_buffer_cast_triton(
+            kv,
+            loc,
+            cache_k_nope,
+            None,
+            dcp_world_size=2,
+            dcp_rank=0,
+        )
 
 
 @CUDA_TMA_ONLY

@@ -1058,7 +1058,7 @@ struct KdaFusedDecodeKernel {
       kernel = select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages);
     } else if (kH == 6) {
       kernel = select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages);
-    } else if (kH == 8 || kH == 16 || kH == 32) {
+    } else if (kH == 8 || kH == 16) {
       // Measured on H200 at 8/16 heads: evict-first state traffic is 1-9%
       // faster up to 1024 (token, head) blocks and 1-2% slower from 1600;
       // Blackwell was not measured with it, so it keeps the default policy.
@@ -1067,13 +1067,14 @@ struct KdaFusedDecodeKernel {
       if (kH == 8) {
         kernel = stream_state ? select_kda_fused_decode_k3_kernel<8, kUsePDL, true>(use_lower_bound, tma_stages)
                               : select_kda_fused_decode_k3_kernel<8, kUsePDL>(use_lower_bound, tma_stages);
-      } else if (kH == 16) {
+      } else {
         kernel = stream_state ? select_kda_fused_decode_k3_kernel<16, kUsePDL, true>(use_lower_bound, tma_stages)
                               : select_kda_fused_decode_k3_kernel<16, kUsePDL>(use_lower_bound, tma_stages);
-      } else {
-        kernel = stream_state ? select_kda_fused_decode_k3_kernel<32, kUsePDL, true>(use_lower_bound, tma_stages)
-                              : select_kda_fused_decode_k3_kernel<32, kUsePDL>(use_lower_bound, tma_stages);
       }
+    } else if (kH == 32) {
+      // H=32 (e.g., GLM-5.3-Flash TP2) was not profiled with evict-first state
+      // streaming on H200, so keep the default cache policy.
+      kernel = select_kda_fused_decode_k3_kernel<32, kUsePDL>(use_lower_bound, tma_stages);
     }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);

@@ -101,6 +101,8 @@ def set_mla_kv_buffer_kernel_norope(
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     PAGE_STRIDE: tl.constexpr = 0,
@@ -116,8 +118,9 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc != reserved_skip_index
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = (
         kv_buffer_ptr
         + paged_row_offset(safe_loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
@@ -267,6 +270,8 @@ def _set_mla_kv_buffer_impl(
             cache_k_nope.stride(0),
             nope_dim,
             BLOCK=BLOCK,
+            DCP_RANK=dcp_rank,
+            DCP_WORLD_SIZE=dcp_world_size,
             **page_kwargs,
             **pdl_kwargs,
         )
@@ -389,31 +394,14 @@ def set_mla_kv_buffer_cast_triton(
     page_kwargs = {"PAGE_SIZE": page_size, "PAGE_STRIDE": page_stride}
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     if not has_rope:
-        if dcp_world_size == 1:
-            set_mla_kv_buffer_kernel_norope[(loc.numel(), 1)](
-                kv_buffer,
-                cache_k_nope,
-                loc,
-                reserved_skip_index,
-                row_stride,
-                cache_k_nope.stride(0),
-                nope_dim,
-                BLOCK=triton.next_power_of_2(nope_dim),
-                **page_kwargs,
-                **pdl_kwargs,
-            )
-            return
-        set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+        set_mla_kv_buffer_kernel_norope[(loc.numel(), 1)](
             kv_buffer,
-            cache_k_nope,
             cache_k_nope,
             loc,
             reserved_skip_index,
             row_stride,
             cache_k_nope.stride(0),
-            cache_k_nope.stride(0),
             nope_dim,
-            0,
             BLOCK=triton.next_power_of_2(nope_dim),
             DCP_RANK=dcp_rank,
             DCP_WORLD_SIZE=dcp_world_size,

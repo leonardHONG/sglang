@@ -118,8 +118,17 @@ class TestKdaDecodeMtp(CustomTestCase):
         if get_device_sm() < 90:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM90a+")
 
-    def _run(self, num_requests, num_spec, *, onorm, block_threads=None, strided=False):
-        kwargs = _make_inputs(num_requests, num_spec)
+    def _run(
+        self,
+        num_requests,
+        num_spec,
+        *,
+        onorm,
+        num_heads=2,
+        block_threads=None,
+        strided=False,
+    ):
+        kwargs = _make_inputs(num_requests, num_spec, num_heads=num_heads)
         _, num_tokens, num_heads, key_dim = kwargs["x_v"].shape
         intermediate = torch.zeros(
             num_requests,
@@ -152,10 +161,14 @@ class TestKdaDecodeMtp(CustomTestCase):
         return output, intermediate, gate, weight
 
     def test_output_norm(self):
-        for num_spec in (0, 2):
-            with self.subTest(num_spec=num_spec):
-                raw, raw_states, gate, weight = self._run(4, num_spec, onorm=False)
-                fused, fused_states, _, _ = self._run(4, num_spec, onorm=True)
+        for num_heads, num_spec in ((2, 0), (2, 2), (32, 0), (32, 3)):
+            with self.subTest(num_heads=num_heads, num_spec=num_spec):
+                raw, raw_states, gate, weight = self._run(
+                    4, num_spec, onorm=False, num_heads=num_heads
+                )
+                fused, fused_states, _, _ = self._run(
+                    4, num_spec, onorm=True, num_heads=num_heads
+                )
                 raw = raw.float()
                 expected = (
                     raw
@@ -360,6 +373,7 @@ class TestKdaDecodeMtpBf16State(CustomTestCase):
             (32, 4, 12),  # Kimi-K3.1 at TP8: 12 KDA heads per rank, 5 tokens
             (16, 6, 12),  # 7 tokens
             (3, 7, 2),  # 8 tokens, the gate's upper bound
+            (4, 3, 32),  # GLM-5.3-Flash at TP2: 32 KDA heads per rank, 4 verify tokens
         ]
         for n, num_spec, h in cases:
             for ring in (False, True):

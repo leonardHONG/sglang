@@ -24,23 +24,83 @@ from sglang.srt.runtime_context import get_model, get_spec
 logger = logging.getLogger(__name__)
 
 
-def _checkpoint_has_nvfp4_nextn_experts(layer_id: int) -> bool:
-    """Return True when the draft checkpoint's index declares NVFP4 expert scales
-    for the NextN layer (e.g. ``layers.45.mlp.experts.*.weight_scale``)."""
-    model_path = get_spec().speculative_draft_model_path or get_model().model_path
-    if not model_path or not os.path.isdir(model_path):
-        return False
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    if not os.path.isfile(index_path):
-        return False
+def _resolve_local_checkpoint_dir(model_path: str) -> str | None:
+    if not model_path:
+        return None
+    if os.path.isdir(model_path):
+        return model_path
     try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            weight_map = json.load(f).get("weight_map", {})
-    except Exception:
+        from huggingface_hub import snapshot_download
+
+        local_dir = snapshot_download(
+            model_path,
+            local_files_only=True,
+            allow_patterns=["model.safetensors.index.json", "model.safetensors"],
+        )
+        if local_dir and os.path.isdir(local_dir):
+            return local_dir
+    except Exception as exc:
+        logger.debug(
+            "Unable to resolve local HuggingFace cache for %r: %s",
+            model_path,
+            exc,
+        )
+    return None
+
+
+def _load_checkpoint_nextn_keys(layer_id: int) -> set[str] | None:
+    """Return all weight tensor names belonging to NextN ``layer_id`` from the
+    checkpoint index (sharded) or safetensors header (single-file), or None if
+    unavailable."""
+    model_path = get_spec().speculative_draft_model_path or get_model().model_path
+    local_dir = _resolve_local_checkpoint_dir(model_path)
+    if local_dir is None:
+        return None
+
+    layer_needle = f"layers.{layer_id}."
+    index_path = os.path.join(local_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            return {k for k in weight_map if layer_needle in k}
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+            logger.warning(
+                "Failed to read NextN checkpoint index %s; falling back to BF16 NextN: %s",
+                index_path,
+                exc,
+            )
+            return None
+
+    single_path = os.path.join(local_dir, "model.safetensors")
+    if os.path.isfile(single_path):
+        try:
+            from safetensors import safe_open
+
+            with safe_open(single_path, framework="pt", device="cpu") as f:
+                return {k for k in f.keys() if layer_needle in k}
+        except Exception as exc:
+            logger.warning(
+                "Failed to read single-file NextN checkpoint header %s; "
+                "falling back to BF16 NextN: %s",
+                single_path,
+                exc,
+            )
+            return None
+
+    return None
+
+
+def _nextn_submodule_is_excluded(quant_config, layer_id: int, submodule: str) -> bool:
+    if not hasattr(quant_config, "is_layer_excluded"):
         return False
-    needle = f"layers.{layer_id}.mlp.experts."
     return any(
-        needle in k and k.endswith(".weight_scale") for k in weight_map
+        quant_config.is_layer_excluded(candidate)
+        for candidate in (
+            f"model.decoder.{submodule}",
+            f"model.layers.{layer_id}.{submodule}",
+            f"model.language_model.layers.{layer_id}.{submodule}",
+        )
     )
 
 
@@ -102,28 +162,66 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
                 )
                 return None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            is_excluded = hasattr(quant_config, "is_layer_excluded") and (
-                quant_config.is_layer_excluded("model.decoder.mlp.experts")
-                or quant_config.is_layer_excluded(f"model.layers.{n}.mlp.experts")
-                or quant_config.is_layer_excluded(
-                    f"model.language_model.layers.{n}.mlp.experts"
-                )
-            )
-            if not is_excluded and _checkpoint_has_nvfp4_nextn_experts(n):
-                self._preserve_modelopt_fp4_nextn = True
-                logger.info(
-                    "GLM5 NextN layer %d experts are NVFP4-quantized in checkpoint; "
-                    "preserving modelopt_fp4 for draft MoE.",
-                    n,
-                )
-                return quant_config
-
         return super()._resolve_nextn_quant_config(config, quant_config)
+
+    def _should_preserve_modelopt_fp4_nextn(self, config, nextn_quant_config) -> bool:
+        if (
+            nextn_quant_config is None
+            or nextn_quant_config.get_name() != "modelopt_fp4"
+        ):
+            return False
+        n = config.num_hidden_layers
+        if _nextn_submodule_is_excluded(nextn_quant_config, n, "mlp.experts"):
+            return False
+        nextn_keys = _load_checkpoint_nextn_keys(n)
+        if not nextn_keys:
+            return False
+        expert_needle = f"layers.{n}.mlp.experts."
+        has_nvfp4_experts = any(
+            expert_needle in k and k.endswith(".weight_scale") for k in nextn_keys
+        )
+        if not has_nvfp4_experts:
+            return False
+        # Verify non-expert NextN linear sub-trees that lack NVFP4 weight_scale
+        # in the checkpoint are actually excluded by quant_config; otherwise
+        # preserving modelopt_fp4 would instantiate FP4 weights for BF16 tensors.
+        for submodule, probe_weights in (
+            ("self_attn.q_b_proj", (f"layers.{n}.self_attn.q_b_proj",)),
+            ("self_attn.o_proj", (f"layers.{n}.self_attn.o_proj",)),
+            (
+                "mlp.shared_experts.down_proj",
+                (f"layers.{n}.mlp.shared_experts.down_proj",),
+            ),
+        ):
+            has_weight = any(
+                any(p in k for p in probe_weights) and k.endswith(".weight")
+                for k in nextn_keys
+            )
+            has_scale = any(
+                any(p in k for p in probe_weights) and k.endswith(".weight_scale")
+                for k in nextn_keys
+            )
+            if (
+                has_weight
+                and not has_scale
+                and not _nextn_submodule_is_excluded(nextn_quant_config, n, submodule)
+            ):
+                logger.warning(
+                    "GLM5 NextN layer %d has unquantized %s in checkpoint without "
+                    "matching quant_config exclusion; falling back to BF16 NextN.",
+                    n,
+                    submodule,
+                )
+                return False
+        logger.info(
+            "GLM5 NextN layer %d experts are NVFP4-quantized in checkpoint; "
+            "preserving modelopt_fp4 for draft MoE.",
+            n,
+        )
+        return True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         self._root_quantization_config = getattr(config, "quantization_config", None)
-        self._preserve_modelopt_fp4_nextn = False
         Glm5NextForConditionalGeneration.register_modelslim_projection_aliases(
             quant_config
         )

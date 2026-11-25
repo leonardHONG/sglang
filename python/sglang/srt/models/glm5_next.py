@@ -1693,8 +1693,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             and not is_dp_attention_enabled()
         )
 
+    @torch.inference_mode()
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
         from sglang.srt.layers.quantization.modelopt_quant import (
             ModelOptFp4LinearMethod,
         )
@@ -1707,18 +1709,60 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if key in seen:
                     continue
                 seen.add(key)
-                hidden_states = torch.randn(
+                hidden_states = torch.zeros(
                     (num_tokens, module.gate.weight.shape[1]),
                     dtype=dtype,
                     device=experts.w13_weight.device,
                 )
                 router_logits = module.gate(hidden_states)
-                experts(hidden_states, module.topk(hidden_states, router_logits))
-                del hidden_states, router_logits
+                out = experts(hidden_states, module.topk(hidden_states, router_logits))
+                del out, router_logits, hidden_states
+            elif isinstance(module, Glm5NextMLP) and getattr(
+                module, "_enable_nvfp4_gemm_swiglu_fusion", False
+            ):
+                gate_up = module.gate_up_proj
+                down = module.down_proj
+                if not hasattr(gate_up, "weight_swiglu_interleaved"):
+                    continue
+                key = (
+                    "nvfp4_swiglu_mlp",
+                    gate_up.input_size_per_partition,
+                    gate_up.output_size_per_partition,
+                    module.swiglu_limit,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
+                    nvfp4_gemm_swiglu_nvfp4_quant,
+                )
+
+                hidden_states = torch.zeros(
+                    (num_tokens, gate_up.input_size_per_partition),
+                    dtype=dtype,
+                    device=gate_up.weight_swiglu_interleaved.device,
+                )
+                x_fp4, x_scale = fp4_quantize(
+                    hidden_states, gate_up.input_scale_inv, enable_pdl=True
+                )
+                out_fp4, out_scale = nvfp4_gemm_swiglu_nvfp4_quant(
+                    x_fp4,
+                    x_scale,
+                    gate_up.weight_swiglu_interleaved,
+                    gate_up.weight_scale_swiglu_interleaved,
+                    gate_up.alpha,
+                    down.input_scale_inv,
+                    enable_pdl=True,
+                    swiglu_limit=module.swiglu_limit,
+                )
+                out = down.quant_method.apply(down, (out_fp4, out_scale))
+                del out, out_fp4, out_scale, x_fp4, x_scale, hidden_states
             elif (
                 isinstance(module, LinearBase)
                 and isinstance(module.quant_method, ModelOptFp4LinearMethod)
                 and not getattr(module, "_accepts_prequantized_fp4", False)
+                and not getattr(module, "_interleave_for_swiglu_fusion", False)
+                and module.weight.numel() > 0
             ):
                 key = (
                     "nvfp4_linear",
@@ -1728,13 +1772,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if key in seen:
                     continue
                 seen.add(key)
-                hidden_states = torch.randn(
+                hidden_states = torch.zeros(
                     (num_tokens, module.input_size_per_partition),
                     dtype=dtype,
                     device=module.weight.device,
                 )
-                module.quant_method.apply(module, hidden_states)
-                del hidden_states
+                out = module.quant_method.apply(module, hidden_states)
+                del out, hidden_states
         if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
             return 0
         return len(seen)
