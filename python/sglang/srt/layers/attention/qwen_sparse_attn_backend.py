@@ -2021,16 +2021,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 if self._kv_shard_pool is None
                 else getattr(metadata, "kv_shard_slot_table", None)
             )
-        if (
-            save_kv_cache
-            and topk_indices.ndim == 2
-            and cu_seqlens_q.shape[0] - 1 == bs
-            and slot_table is not None
-            and slot_table.is_cuda
-            and slot_table.stride(-1) == 1
-            and slot_table.shape[0] >= bs
-            and slot_table.shape[1] >= max(sequence_lens[:bs], default=0)
-        ):
+        if save_kv_cache and slot_table is not None and slot_table.is_cuda:
             # Every selected token, prefix or new, is in the pool now, so read
             # K/V in place instead of packing each request's whole context per layer.
             output = sparse_gqa_paged_prefill_triton(
@@ -3257,6 +3248,7 @@ def prewarm_qsa_prefill_kernels(
         for index_n_heads, index_head_dim, block_topk in indexer_geoms:
             block_q = max(1, 128 // index_n_heads)
             block_n = 64
+            min_scored_len = QSAIndexer.prefill_min_scored_len(block_topk)
             # Derive minimal (rows, width) pairs that cover every reachable
             # key_splits specialization on this GPU's SM count.
             split_targets: dict[int, tuple[int, int]] = {}
@@ -3284,7 +3276,7 @@ def prewarm_qsa_prefill_kernels(
                 starts = torch.zeros(rows, dtype=torch.int32, device=device)
                 ends = torch.ones(rows, dtype=torch.int32, device=device)
                 qsa_mqa_prefill_relative(
-                    q_idx, k_comp, starts, ends, width, None, block_topk
+                    q_idx, k_comp, starts, ends, width, None, min_scored_len
                 )
                 runs += 1
 
