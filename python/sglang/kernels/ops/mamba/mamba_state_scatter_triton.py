@@ -995,21 +995,43 @@ def copy_indexed_ssm_rows(
     src_indices: torch.Tensor,
     dst: torch.Tensor,
     dst_indices: torch.Tensor,
+    *,
+    assume_disjoint_rows: bool = False,
 ) -> bool:
     """Copy ``src[src_indices[i]]`` into ``dst[dst_indices[i]]`` in one Triton
     launch without allocating an intermediate gathered tensor. Returns True if
-    handled, False if caller should fall back to PyTorch indexing."""
+    handled, False if caller should fall back to PyTorch indexing.
+
+    Because the Triton kernel reads and writes rows in parallel across CTAs,
+    in-place copies where ``src`` and ``dst`` share storage require disjoint
+    source and destination row sets; callers must explicitly opt in via
+    ``assume_disjoint_rows=True`` only when disjointness is guaranteed by
+    construction (otherwise falls back to PyTorch's atomic gather-then-scatter).
+    """
     num_rows = dst_indices.numel()
     if num_rows == 0:
         return True
     if (
-        not (src.is_cuda and dst.is_cuda)
+        not (
+            src.is_cuda
+            and dst.is_cuda
+            and src_indices.is_cuda
+            and dst_indices.is_cuda
+        )
+        or dst.device != src.device
+        or src_indices.device != src.device
+        or dst_indices.device != src.device
         or src.ndim < 2
         or dst.ndim != src.ndim
         or src.shape[1:] != dst.shape[1:]
         or src_indices.numel() != num_rows
         or not src[0].is_contiguous()
         or not dst[0].is_contiguous()
+    ):
+        return False
+    if (
+        not assume_disjoint_rows
+        and src.untyped_storage().data_ptr() == dst.untyped_storage().data_ptr()
     ):
         return False
     row_elems = src[0].numel()
@@ -1085,7 +1107,15 @@ def scatter_conv_track_rows(
     if num_rows == 0:
         return True
     if (
-        not (mixed_qkv.is_cuda and conv_states.is_cuda)
+        not (
+            mixed_qkv.is_cuda
+            and conv_states.is_cuda
+            and track_conv_indices.is_cuda
+            and dst_slot_indices.is_cuda
+        )
+        or conv_states.device != mixed_qkv.device
+        or track_conv_indices.device != mixed_qkv.device
+        or dst_slot_indices.device != mixed_qkv.device
         or mixed_qkv.ndim != 2
         or conv_states.ndim != 3
         or track_conv_indices.ndim != 2

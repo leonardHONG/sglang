@@ -9,6 +9,7 @@ field plus a C++ range check, so the per-call host cost stays small.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 _MAX_FIELDS = 16
 _ENTRIES = 7
+_TLS = threading.local()
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
@@ -155,6 +157,15 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
+def _get_tls_desc_buffer(length: int) -> tuple[torch.Tensor, object]:
+    buf = getattr(_TLS, "desc_buf", None)
+    if buf is None:
+        buf = torch.empty(_MAX_FIELDS * _ENTRIES, dtype=torch.int64)
+        _TLS.desc_buf = buf
+        _TLS.desc_view = buf.numpy()
+    return buf[:length], _TLS.desc_view
+
+
 def try_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
     """Stateless one-launch CUDA copy for small fields without Triton recompiles."""
     if len(dsts) < 2 or len(dsts) != len(srcs) or len(dsts) > _MAX_FIELDS:
@@ -167,7 +178,10 @@ def try_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> 
     desc = _describe(dsts, srcs, allow_pinned_src=False)
     if desc is None:
         return False
-    return _run_host_desc(dsts[0], torch.tensor(desc, dtype=torch.int64))
+    n_entries = len(desc)
+    desc_tensor, desc_view = _get_tls_desc_buffer(n_entries)
+    desc_view[:n_entries] = desc
+    return _run_host_desc(dsts[0], desc_tensor)
 
 
 __all__ = ["SmallFieldCopyPlan", "try_small_field_copy"]

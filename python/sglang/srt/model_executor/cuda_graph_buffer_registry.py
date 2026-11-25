@@ -65,10 +65,11 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             # pays off only across dtype pairs, and costs per-pair host checks.
             torch._foreach_copy_(dsts, srcs)
             return
-        from sglang.kernels.ops.memory.small_field_copy import try_small_field_copy
+        if envs.SGLANG_OPT_SMALL_FIELD_COPY.get():
+            from sglang.kernels.ops.memory.small_field_copy import try_small_field_copy
 
-        if try_small_field_copy(dsts, srcs):
-            return
+            if try_small_field_copy(dsts, srcs):
+                return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):

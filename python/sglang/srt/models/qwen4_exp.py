@@ -1198,6 +1198,76 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return self.reduce(self.gather(input_ids))
 
 
+class _PLEScratchPool:
+    """Shared 3-buffer scratch pool reused sequentially across all PLE layers in
+    one Qwen4ExpModel (avoids holding N_layers copies of [T, hc*H] in VRAM).
+
+    Permanent capacity is capped at the configured prefill buffer ceiling so an
+    unusually large eager forward falls back to temporary allocations that are
+    immediately freed rather than sticking in VRAM permanently.
+    """
+
+    def __init__(self, max_retained_tokens: Optional[int] = None) -> None:
+        self._max_retained_tokens = max_retained_tokens
+        self._buffers: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+
+    def _retained_cap(self) -> int:
+        if self._max_retained_tokens is not None:
+            return self._max_retained_tokens
+        try:
+            from sglang.srt.runtime_context import (
+                get_schedule,
+                max_prefill_buffer_tokens,
+            )
+
+            ceiling = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+            if ceiling and ceiling > 0:
+                return int(ceiling)
+        except Exception:
+            pass
+        return 16640
+
+    def get(
+        self,
+        token_count: int,
+        cols: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if token_count > self._retained_cap():
+            return (None, None, None)
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        scratch = self._buffers
+        if (
+            scratch is None
+            or scratch[0].shape[0] < token_count
+            or scratch[0].shape[1] != cols
+            or scratch[0].dtype != dtype
+            or scratch[0].device != device
+        ):
+            cap = token_count
+            if (
+                scratch is not None
+                and scratch[0].shape[1] == cols
+                and scratch[0].dtype == dtype
+                and scratch[0].device == device
+            ):
+                cap = max(cap, scratch[0].shape[0])
+            scratch = tuple(
+                torch.empty((cap, cols), dtype=dtype, device=device) for _ in range(3)
+            )
+            self._buffers = scratch
+        return (
+            scratch[0][:token_count],
+            scratch[1][:token_count],
+            scratch[2][:token_count],
+        )
+
+
 class Qwen4ExpPLELayer(nn.Module):
     def __init__(
         self,
@@ -1273,31 +1343,18 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
-        self._ple_scratch: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None
+        self._ple_scratch_pool: Optional[_PLEScratchPool] = None
+
+    def set_scratch_pool(self, pool: _PLEScratchPool) -> None:
+        self._ple_scratch_pool = pool
 
     def _get_ple_scratch(
         self, token_count: int, dtype: torch.dtype, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cols = self.hc_count * self.hidden_size
-        scratch = self._ple_scratch
-        if (
-            scratch is None
-            or scratch[0].shape[0] < token_count
-            or scratch[0].dtype != dtype
-            or scratch[0].device != device
-        ):
-            cap = max(token_count, scratch[0].shape[0] if scratch is not None else 0)
-            scratch = tuple(
-                torch.empty((cap, cols), dtype=dtype, device=device) for _ in range(3)
-            )
-            self._ple_scratch = scratch
-        return (
-            scratch[0][:token_count],
-            scratch[1][:token_count],
-            scratch[2][:token_count],
-        )
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        pool = self._ple_scratch_pool
+        if pool is None:
+            return (None, None, None)
+        return pool.get(token_count, self.hc_count * self.hidden_size, dtype, device)
 
     def _apply_ple_norm(
         self,
@@ -2430,6 +2487,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
         )
+        self._ple_scratch_pool = _PLEScratchPool() if self.has_ple else None
+        if self._ple_scratch_pool is not None:
+            for layer_id in range(self.start_layer, self.end_layer):
+                ple = self.layers[layer_id].ple
+                if ple is not None:
+                    ple.set_scratch_pool(self._ple_scratch_pool)
         self.ple_ngram_size = int(config.ngram_size) if self.has_ple else None
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None

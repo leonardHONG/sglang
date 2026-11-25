@@ -1186,11 +1186,16 @@ class MambaAttnBackendBase(AttentionBackend):
                     track_states.squeeze(0).to(ssm_states.dtype, copy=False)
                 )
             if forward_metadata.track_ssm_final_src.numel() > 0:
+                # track_ssm_final_src holds active request working slots
+                # (mamba_cache_indices) while track_ssm_final_dst holds separate
+                # ping-pong radix checkpoint slots (mamba_track_indices), so the
+                # source and destination row sets are disjoint by construction.
                 if not copy_indexed_ssm_rows(
                     ssm_states,
                     forward_metadata.track_ssm_final_src,
                     ssm_states,
                     forward_metadata.track_ssm_final_dst,
+                    assume_disjoint_rows=True,
                 ):
                     ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                         forward_metadata.track_ssm_final_src

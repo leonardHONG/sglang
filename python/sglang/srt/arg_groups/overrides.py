@@ -2178,20 +2178,57 @@ PREFILL_CHUNK_TAIL_TOLERANCE_MIN_CHUNK = 8192
 PREFILL_CHUNK_TAIL_TOLERANCE_MAX = 256
 
 
-def prefill_chunk_tail_tolerance(chunked_prefill_size: Optional[int]) -> int:
+def prefill_chunk_tail_tolerance(server_args: Any) -> int:
     """Small overflow allowance to avoid splitting off tiny tail chunks
-    (e.g., 2 * 8244 = 16488 vs chunked_prefill_size=16384)."""
+    (e.g., 2 * 8244 = 16488 vs chunked_prefill_size=16384).
+
+    Accounted for in ``max_prefill_buffer_tokens`` so every prefill workspace
+    (MoE, attention, dispatcher, eager runner, disagg, prefill graphs) sizes
+    consistently to ``chunked_prefill_size + tolerance``.
+
+    Controlled by ``SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE``:
+    - ``-1`` (default): auto-enabled only for compressed-KV (QSA) models;
+    - ``0``: disabled for all models;
+    - ``> 0``: explicit token cap (clamped to ``chunked_prefill_size // 32``).
+    """
+    cfg = resolving_view(server_args)
+    chunked = getattr(cfg, "chunked_prefill_size", None)
+    if chunked is None or chunked < PREFILL_CHUNK_TAIL_TOLERANCE_MIN_CHUNK:
+        return 0
     if (
-        chunked_prefill_size is None
-        or chunked_prefill_size < PREFILL_CHUNK_TAIL_TOLERANCE_MIN_CHUNK
+        getattr(cfg, "device", "cuda") == "cpu"
+        or getattr(cfg, "pp_size", 1) != 1
+        or getattr(cfg, "ep_size", 1) != 1
+        or getattr(cfg, "dp_size", 1) != 1
+        or getattr(cfg, "enable_mixed_chunk", False)
+        or getattr(cfg, "enable_dynamic_chunking", False)
+        or getattr(cfg, "enable_deterministic_inference", False)
     ):
         return 0
-    return min(PREFILL_CHUNK_TAIL_TOLERANCE_MAX, chunked_prefill_size // 32)
+
+    override = envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.get()
+    if override == 0:
+        return 0
+
+    max_allowed = min(PREFILL_CHUNK_TAIL_TOLERANCE_MAX, chunked // 32)
+    if override > 0:
+        return min(override, max_allowed)
+
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+
+    try:
+        model_config = model_config_of(server_args)
+    except Exception:
+        model_config = None
+    if model_config is None or not uses_compressed_kv_attention(model_config.hf_config):
+        return 0
+    return max_allowed
 
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
-    """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
+    """Prefill-buffer ceiling: chunked_prefill_size (+ tail-split tolerance when
+    enabled), except PP dynamic chunking can grow chunks toward
+    max_prefill_tokens and probe at 1.25x.
 
     Records with a registered ceiling provider (see
     ``register_prefill_buffer_ceiling``) answer through it."""
@@ -2202,6 +2239,8 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
         else 0
     )
     tokens = chunked
+    if chunked:
+        tokens += prefill_chunk_tail_tolerance(server_args)
     if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
         tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
     record = server_args

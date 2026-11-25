@@ -51,10 +51,10 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
-    get_resources,
     get_schedule,
     get_serving,
     get_spec,
+    max_prefill_buffer_tokens,
     is_scheduler_io_rank,
     publish,
     spawn_world_rank,
@@ -4719,21 +4719,22 @@ class Scheduler(
         tail_split_tolerance = 0
         if (
             chunked_prefill_size is not None
-            and chunked_prefill_size >= 8192
             and self.dllm_config is None
             and self.dynamic_chunk_sizer is None
             and not self.is_mixed_chunk
-            and get_parallel().pp_size == 1
-            and get_parallel().ep_size == 1
-            and get_parallel().dp_size == 1
-            and not get_exec().deterministic.enable_deterministic_inference
             and not self.model_config.use_ngram_embedding
             and getattr(attn_backend, "prefill_kernel_max_seqlen_q_grid", None) is None
-            and get_resources().buffers.get("trtllm_gen_mxfp4_moe_workspace") is None
         ):
             from sglang.srt.arg_groups.overrides import prefill_chunk_tail_tolerance
 
-            tail_split_tolerance = prefill_chunk_tail_tolerance(chunked_prefill_size)
+            tail_split_tolerance = prefill_chunk_tail_tolerance(self.server_args)
+            # Never exceed the prefill buffer ceiling that workspaces allocated for.
+            buffer_ceiling = max_prefill_buffer_tokens()
+            if buffer_ceiling > 0:
+                tail_split_tolerance = min(
+                    tail_split_tolerance,
+                    max(0, buffer_ceiling - chunked_prefill_size),
+                )
             prefill_graph_runner = (
                 self.tp_worker.model_runner.prefill_cuda_graph_runner
             )

@@ -285,23 +285,18 @@ def handle_gpu_memory_settings(server_args: Any):
         # Add one extra top bucket to keep Breakable Prefill CUDA Graphs active
         # when PrefillAdder absorbs tiny chunk tail overflows (e.g., 2 * 8244 = 16488
         # vs chunked_prefill_size=16384 -> bucket 16640).
-        tail_tol = prefill_chunk_tail_tolerance(cfg.chunked_prefill_size)
+        tail_tol = prefill_chunk_tail_tolerance(server_args)
         if (
             tail_tol > 0
             and prefill_max_bs_is_default
             and prefill_bs_is_default
-            and cfg.device != "cpu"
             and prefill_cuda_graph_config.backend == Backend.BREAKABLE
-            and cfg.pp_size == 1
-            and cfg.ep_size == 1
-            and cfg.dp_size == 1
             and not use_mla_backend(server_args)
             and prefill_cuda_graph_config.max_bs == cfg.chunked_prefill_size
             and (
                 cfg.max_total_tokens is None
                 or cfg.max_total_tokens >= prefill_cuda_graph_config.max_bs + tail_tol
             )
-            and "llama-2" not in cfg.model_path.lower()
         ):
             extra_bucket = prefill_cuda_graph_config.max_bs + tail_tol
             if extra_bucket not in prefill_cuda_graph_config.bs:

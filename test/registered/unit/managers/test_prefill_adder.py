@@ -3143,6 +3143,84 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder_large.new_chunked_req, r7)
         self.assertEqual(r7.extend_end, 8128)
 
+    def test_tail_split_tolerance_ceiling_and_model_scoping(self):
+        """Tail-split tolerance is auto-enabled only for compressed-KV (QSA)
+        models, respects SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE, and is reflected
+        directly in max_prefill_buffer_tokens so all prefill workspaces match."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.overrides import (
+            max_prefill_buffer_tokens,
+            prefill_chunk_tail_tolerance,
+        )
+        from sglang.srt.environ import envs
+
+        def make_args(chunked=16384):
+            return SimpleNamespace(
+                chunked_prefill_size=chunked,
+                max_prefill_tokens=chunked,
+                device="cuda",
+                pp_size=1,
+                ep_size=1,
+                dp_size=1,
+                enable_mixed_chunk=False,
+                enable_dynamic_chunking=False,
+                enable_deterministic_inference=False,
+            )
+
+        qsa_cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="qwen4_exp", qsa_compress_ratio=16)
+        )
+        llama_cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="llama")
+        )
+
+        with (
+            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+            patch(
+                "sglang.srt.arg_groups.overrides.model_config_of",
+                return_value=llama_cfg,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
+                return_value=False,
+            ),
+        ):
+            args = make_args(16384)
+            self.assertEqual(prefill_chunk_tail_tolerance(args), 0)
+            self.assertEqual(max_prefill_buffer_tokens(args), 16384)
+
+        with (
+            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+            patch(
+                "sglang.srt.arg_groups.overrides.model_config_of",
+                return_value=qsa_cfg,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
+                return_value=True,
+            ),
+        ):
+            args = make_args(16384)
+            self.assertEqual(prefill_chunk_tail_tolerance(args), 256)
+            self.assertEqual(max_prefill_buffer_tokens(args), 16640)
+
+        with (
+            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(0),
+            patch(
+                "sglang.srt.arg_groups.overrides.model_config_of",
+                return_value=qsa_cfg,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
+                return_value=True,
+            ),
+        ):
+            args = make_args(16384)
+            self.assertEqual(prefill_chunk_tail_tolerance(args), 0)
+            self.assertEqual(max_prefill_buffer_tokens(args), 16384)
+
 
 if __name__ == "__main__":
     unittest.main()

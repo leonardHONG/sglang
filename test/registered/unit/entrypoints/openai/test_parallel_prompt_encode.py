@@ -748,5 +748,127 @@ class TestPromptSegments(_EncodeCase):
         self.assertNotIn("hello world " * 30, encoder.cache)
 
 
+class TestQwenAndNFCParallelEncodeFuzz(unittest.TestCase):
+    """Fuzz Qwen2/Qwen3.5 regexes, NFC normalizer, and CJK newline cut points
+    against single-call tokenizer.encode across adversarial Unicode inputs."""
+
+    @staticmethod
+    def _build_qwen_style_tokenizer(
+        regex_pattern: str,
+        *,
+        use_nfc: bool = True,
+        normalized_added: bool = False,
+    ) -> PreTrainedTokenizerFast:
+        corpus = [
+            "hello world foo bar baz qux 1234567890 !@#$%^&*()_+-=[]{}|;':\",./<>?\n",
+            "café naïve résumé über 日本語 テスト 中文测试 繁體中文 한국어 테스트\n",
+            "e\u0301 a\u0300 o\u0302\u0323 \u1100\u1161\u11a8 가나다라마바사\n",
+            "def foo(x: int) -> str:\n    return f'{x}   spaced   text'\r\n",
+            "<|im_start|>user\n你好世界\nhello<|im_end|>\n<|im_start|>assistant\n",
+        ]
+        backend = Tokenizer(models.BPE())
+        if use_nfc:
+            backend.normalizer = normalizers.NFC()
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(Regex(regex_pattern), behavior="isolated"),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        backend.decoder = decoders.ByteLevel()
+        backend.post_processor = processors.ByteLevel(trim_offsets=False)
+        trainer = trainers.BpeTrainer(
+            vocab_size=2048,
+            special_tokens=["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+        backend.train_from_iterator(corpus * 20, trainer=trainer)
+        if normalized_added:
+            backend.add_tokens([AddedToken("NORM_TOK", normalized=True)])
+        return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+    def test_nfc_rejected_when_normalized_added_tokens_present(self):
+        tok = self._build_qwen_style_tokenizer(
+            ppe._QWEN35_INTRA_SPLIT_REGEX, use_nfc=True, normalized_added=True
+        )
+        tok._tokenizer.add_tokens([AddedToken("a\n中", normalized=True)])
+        plan = ppe._plan_for(tok)
+        self.assertIsNotNone(plan)
+        _, _, pattern, npattern, intra = plan
+        # Raw (normalized=False) special-token cuts remain safe before NFC,
+        # while normalized added-token cuts and intra-gap NFC cuts are disabled.
+        self.assertIsNotNone(pattern)
+        self.assertIsNone(npattern)
+        self.assertIsNone(intra)
+        text = "<|im_start|>user\n" + ("hello world a\n中 NORM_TOK cafe\u0301\n" * 200) + "<|im_end|>"
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(64):
+            self.assertEqual(
+                ppe.parallel_prompt_encode(tok, text),
+                tok.encode(text),
+            )
+
+    def test_qwen2_and_qwen35_nfc_cjk_combining_fuzz_matches_encode(self):
+        import random
+
+        rng = random.Random(20261126)
+        atoms = [
+            "hello",
+            "world",
+            "don't",
+            "I've",
+            "12345",
+            "0",
+            "   ",
+            " ",
+            "\n",
+            "\r\n",
+            "\n\n",
+            "中文测试段落",
+            "你好，世界！",
+            "日本語の文章テスト",
+            "한국어문장테스트",
+            "café",
+            "cafe\u0301",  # NFD combining acute
+            "o\u0302\u0323",  # multi combining marks
+            "\u1100\u1161\u11a8",  # Hangul Jamo NFD -> 각
+            "a\u0301b",
+            "word \u0301next",
+            "def f(x):\n    return x + 1",
+            "!!!???",
+            "🚀✨",
+            "<|im_start|>user\n",
+            "<|im_end|>\n",
+            "<think>",
+            "</think>",
+        ]
+        for name, regex, use_nfc in (
+            ("qwen2_no_norm", ppe._QWEN2_INTRA_SPLIT_REGEX, False),
+            ("qwen2_nfc", ppe._QWEN2_INTRA_SPLIT_REGEX, True),
+            ("qwen35_nfc", ppe._QWEN35_INTRA_SPLIT_REGEX, True),
+        ):
+            tok = self._build_qwen_style_tokenizer(regex, use_nfc=use_nfc)
+            plan = ppe._plan_for(tok)
+            self.assertIsNotNone(plan, f"expected plan for {name}")
+            self.assertIsNotNone(plan[4], f"expected intra regex for {name}")
+            with (
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(True),
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(64),
+                unittest.mock.patch.object(ppe, "_MIN_CHUNK_CHARS", 64),
+                unittest.mock.patch.object(ppe, "_parallel_ok", True),
+            ):
+                for trial in range(60):
+                    parts = [rng.choice(atoms) for _ in range(rng.randint(25, 90))]
+                    text = "".join(parts)
+                    ref = tok.encode(text, add_special_tokens=False)
+                    got = ppe.parallel_prompt_encode(
+                        tok, text, {"add_special_tokens": False}
+                    )
+                    self.assertEqual(
+                        got,
+                        ref,
+                        f"mismatch in {name} trial={trial} len={len(text)}",
+                    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

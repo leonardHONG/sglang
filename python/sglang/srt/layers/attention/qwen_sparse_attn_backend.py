@@ -2481,19 +2481,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_q_heads: int,
         head_dim: int,
         device: torch.device,
+        num_splits: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        max_splits = 16
-        capacity = max(batch, self._cuda_graph_max_tokens)
+        # Sized once for every captured batch: graphs keep raw pointers to it, so
+        # it is never reallocated. A larger eager batch gets a per-call workspace
+        # by returning None (matching _get_flydsl_decode_workspace).
+        if num_splits <= 1:
+            return None
         ws = self._fp8_decode_workspace
-        if (
-            ws is None
-            or ws[0].shape[0] < capacity
-            or ws[0].shape[1] != num_q_heads
-            or ws[0].shape[3] != head_dim
-            or ws[0].device != device
-        ):
+        if ws is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
+            max_splits = max(4, num_splits)
+            capacity = max(batch, self._cuda_graph_max_tokens)
             self._fp8_decode_workspace = (
                 torch.empty(
                     (capacity, num_q_heads, max_splits, head_dim),
@@ -2507,18 +2507,31 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
             )
             ws = self._fp8_decode_workspace
+        if (
+            ws[0].shape[0] < batch
+            or ws[0].shape[1] != num_q_heads
+            or ws[0].shape[2] < num_splits
+            or ws[0].shape[3] != head_dim
+            or ws[0].device != device
+        ):
+            return None
         return ws
 
     def _prefers_direct_fp8_decode(self, q: torch.Tensor, layer, forward_batch) -> bool:
-        if _is_npu or is_hip() or not q.is_cuda or self._kv_shard_pool is not None:
+        if (
+            _is_npu
+            or is_hip()
+            or not q.is_cuda
+            or getattr(self, "_kv_shard_pool", None) is not None
+        ):
             return False
         mode = getattr(forward_batch, "forward_mode", None)
         if mode is None or not (
             mode.is_decode() or self._is_speculative_paged_mode(mode)
         ):
             return False
-        pool = self.token_to_kv_pool
-        req_pool = self.req_to_token_pool
+        pool = getattr(self, "token_to_kv_pool", None)
+        req_pool = getattr(self, "req_to_token_pool", None)
         if pool is None or req_pool is None or req_pool.req_to_token is None:
             return False
         kv = pool.layer_router.read(layer.layer_id)
@@ -2572,12 +2585,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Direct-read SM90+ FP8 int16-pair decode/verify path: reads scattered
         # FP8 KV directly from the pool (eliminating _qsa_fused_kv_prepare +
         # packed scratch writes), expands block indices inline, and fuses output_gate.
-        req_pool = self.req_to_token_pool
+        req_pool = getattr(self, "req_to_token_pool", None)
         req_to_token = req_pool.req_to_token if req_pool is not None else None
         if (
             not _is_npu
             and not is_hip()
-            and self._kv_shard_pool is None
+            and getattr(self, "_kv_shard_pool", None) is None
             and req_to_token is not None
             and can_use_sparse_gqa_paged_decode_fp8(q, k_buffer, v_buffer, req_to_token)
         ):
@@ -2601,8 +2614,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 if metadata.row_req_pool_indices is not None
                 else forward_batch.req_pool_indices
             )
+            from sglang.srt.layers.attention.qsa.sparse_attn import (
+                _choose_fp8_decode_splits,
+            )
+
+            num_splits = _choose_fp8_decode_splits(
+                q.shape[0], k_buffer.shape[1], q.device
+            )
             ws = self._get_fp8_decode_workspace(
-                q.shape[0], q.shape[1], q.shape[2], q.device
+                q.shape[0], q.shape[1], q.shape[2], q.device, num_splits
             )
             output = sparse_gqa_paged_decode_fp8_triton(
                 q.contiguous(),
@@ -2617,6 +2637,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 query_positions=qpos,
                 output_gate=output_gate,
                 workspace=ws,
+                num_splits=num_splits,
             )
             return output.reshape(q.shape[0], -1)
 
