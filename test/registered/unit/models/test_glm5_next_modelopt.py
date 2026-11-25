@@ -213,6 +213,38 @@ class TestGlm5NextNextNModelOptFp4Resolution(CustomTestCase):
             model._resolve_nextn_quant_config(text_cfg, config)
         self.assertFalse(model._preserve_modelopt_fp4_nextn)
 
+    def test_indexer_kpool_forward_k_only_calls_skip_logits_without_act_quant(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
+        from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+
+        idx = IndexerKPool.__new__(IndexerKPool)
+        called = {}
+
+        def fake_skip_logits(
+            x, positions, forward_batch, layer_id, metadata, return_indices=True
+        ):
+            called.update(
+                x=x,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
+                return_indices=return_indices,
+            )
+
+        idx._forward_cuda_skip_logits = fake_skip_logits
+        fake_meta = object()
+        fake_backend = SimpleNamespace(get_indexer_metadata=lambda lid, fb: fake_meta)
+        with patch.object(
+            dsa_indexer_kpool, "get_attn_backend", return_value=fake_backend
+        ):
+            idx.forward_k_only(
+                x="x", positions="pos", forward_batch="fb", layer_id=45
+            )
+        self.assertEqual(called["layer_id"], 45)
+        self.assertIs(called["metadata"], fake_meta)
+        self.assertFalse(called["return_indices"])
+
 
 if __name__ == "__main__":
     unittest.main()
