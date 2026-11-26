@@ -819,6 +819,50 @@ class QSAIndexer(MultiPlatformOp):
             ),
         )
 
+    def forward_kv_only(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> None:
+        """Write pending-ring keys and compressed blocks without scoring/top-k.
+        Used by split prefill draft extend on the KV-only (L-1) prefix pass."""
+        logical_positions = getattr(forward_batch, "positions", None)
+        if logical_positions is None:
+            logical_positions = positions[0] if positions.ndim == 2 else positions
+        logical_positions = logical_positions.flatten()
+        num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
+        logical_positions = logical_positions[:num_valid_tokens]
+        hidden_states = hidden_states[:num_valid_tokens]
+        positions = (
+            positions[:, :num_valid_tokens]
+            if positions.ndim == 2
+            else positions[:num_valid_tokens]
+        )
+        state_slots = indexer_metadata.pending_ring_slots
+        if state_slots is None:
+            state_slots = self._pending_ring_slots(
+                indexer_metadata,
+                logical_positions,
+                indexer_metadata.compress_member_rows is not None,
+            )
+        _, token_k, state_stored = self.project_qk(
+            hidden_states,
+            positions,
+            pool=indexer_metadata.token_to_kv_pool,
+            cache_loc=state_slots,
+            q_heads_padded=None,
+        )
+        self.update_key_state_and_compress(
+            token_k,
+            logical_positions,
+            positions,
+            indexer_metadata,
+            state_slots=state_slots,
+            state_stored=state_stored,
+        )
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,

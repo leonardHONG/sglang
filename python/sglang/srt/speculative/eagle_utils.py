@@ -168,6 +168,10 @@ def _eagle_prefill_tail_tokens(
 # Measured on H200 with GLM-5.3-Flash: the KV-only pass is one more eager draft forward,
 # a fixed CPU cost that batches of at most this many KV-only tokens did not win back.
 _MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS = 4096
+# QSA MTP draft skips QSA attention + indexer scoring/top-k + MoE + 2x AllReduce on
+# the batch's sum(extend_len - 1) prefix tokens (L >= 1025 for a single request).
+# Regular draft prefill already slices the last row per request before the LM head.
+_MAX_UNSPLIT_QSA_PREFILL_DRAFT_EXTEND_TOKENS = 1024
 
 
 def should_split_prefill_draft_extend(
@@ -176,12 +180,14 @@ def should_split_prefill_draft_extend(
     mm_input_embeds: Optional[torch.Tensor],
     draft_prefill_graph_max_tokens: int,
     target_prefill_graph_max_tokens: int,
+    is_qsa_mtp: bool = False,
 ) -> bool:
     """Whether the draft extend after this prefill runs as a KV-only pass over
     every request's tokens but its last, plus a pass over the last tokens."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    return (
+    kv_only_tokens = batch.extend_num_tokens - len(batch.extend_lens)
+    common_ok = (
         batch.forward_mode == ForwardMode.EXTEND
         and batch.input_embeds is None
         and batch.replace_embeds is None
@@ -193,12 +199,18 @@ def should_split_prefill_draft_extend(
         )
         # The KV-only batch would get an empty extend, which the kpool planner rejects.
         and min(batch.extend_lens) > 1
+    )
+    if not common_ok:
+        return False
+    if is_qsa_mtp:
+        return kv_only_tokens >= _MAX_UNSPLIT_QSA_PREFILL_DRAFT_EXTEND_TOKENS
+    return (
         # DSA attends to requests no longer than this densely, which costs little to skip;
         # the last-token pass would also read their prefixes back from the cache.
-        and batch.seq_lens_cpu.max().item()
+        batch.seq_lens_cpu.max().item()
         > envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
         # A captured draft prefill graph replays the full layer for batches it fits.
-        and batch.extend_num_tokens - len(batch.extend_lens)
+        and kv_only_tokens
         > max(_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS, draft_prefill_graph_max_tokens)
         # 0 = the target captured no prefill graph. A batch above that bound can
         # replay none of them, and splitting those measured slower on B300.

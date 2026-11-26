@@ -13,8 +13,11 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
     DeepseekMLAForwardMixin,
 )
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+from sglang.srt.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
+from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 from sglang.srt.speculative.eagle_utils import (
     _MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS,
+    _MAX_UNSPLIT_QSA_PREFILL_DRAFT_EXTEND_TOKENS,
     should_split_prefill_draft_extend,
     split_prefill_draft_extend,
 )
@@ -81,12 +84,14 @@ def _should_split(
     mm_input_embeds=None,
     draft_prefill_graph_max_tokens=0,
     target_prefill_graph_max_tokens=0,
+    is_qsa_mtp=False,
 ):
     return should_split_prefill_draft_extend(
         batch,
         mm_input_embeds=mm_input_embeds,
         draft_prefill_graph_max_tokens=draft_prefill_graph_max_tokens,
         target_prefill_graph_max_tokens=target_prefill_graph_max_tokens,
+        is_qsa_mtp=is_qsa_mtp,
     )
 
 
@@ -226,6 +231,42 @@ class TestSplitPrefillDraftExtend(CustomTestCase):
         self.assertFalse(_should_split(batch))
         self.assertTrue(_should_split(batch, mm_input_embeds=torch.zeros(_LONG, 2)))
 
+    def test_qsa_mtp_threshold_uses_batch_kv_only_tokens(self):
+        """QSA MTP triggers on batch sum(extend_len - 1) >= 1024 (L >= 1025 for a
+        single request), regardless of draft/target prefill graph caps."""
+        n = _MAX_UNSPLIT_QSA_PREFILL_DRAFT_EXTEND_TOKENS
+        # Single-request boundary: L = 1024 -> 1023 kv_only tokens (False); L = 1025 -> 1024 (True).
+        self.assertFalse(_should_split(_prefill_batch([0], [n]), is_qsa_mtp=True))
+        self.assertTrue(
+            _should_split(
+                _prefill_batch([0], [n + 1]),
+                draft_prefill_graph_max_tokens=8192,
+                target_prefill_graph_max_tokens=512,
+                is_qsa_mtp=True,
+            )
+        )
+        # Multi-request boundary: sum(extend_len - 1) == 1023 vs 1024.
+        half = n // 2
+        self.assertFalse(
+            _should_split(_prefill_batch([0, 0], [half + 1, n - half]), is_qsa_mtp=True)
+        )
+        self.assertTrue(
+            _should_split(
+                _prefill_batch([0, 0], [half + 1, n - half + 1]), is_qsa_mtp=True
+            )
+        )
+        # Common guards still apply (min extend_len > 1, multimodal needs embeds).
+        self.assertFalse(
+            _should_split(_prefill_batch([0, 4], [n + 10, 1]), is_qsa_mtp=True)
+        )
+        mm_batch = _prefill_batch([0], [n + 1], multimodal=True)
+        self.assertFalse(_should_split(mm_batch, is_qsa_mtp=True))
+        self.assertTrue(
+            _should_split(
+                mm_batch, mm_input_embeds=torch.zeros(n + 1, 2), is_qsa_mtp=True
+            )
+        )
+
 
 def _supports_forward_kv_only(
     *, rope, kv_cache_dtype, prefill, decode, attn_cls=DeepseekMLAForwardMixin
@@ -276,6 +317,43 @@ class TestDraftSupportsForwardKVOnly(CustomTestCase):
             self.assertFalse(
                 _supports_forward_kv_only(**bf16, decode="tilelang", attn_cls=attn_cls)
             )
+
+    def test_qwen4_mtp_supports_forward_kv_only_gates(self):
+        """Qwen4Exp MTP split-prefill requires a single QSA layer without PLE or
+        layernorm SP on the first PP rank, and allows both BF16 and FP8 KV."""
+        def _check(
+            *,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            is_qsa=True,
+            ple=None,
+            num_layers=1,
+            is_first_rank=True,
+            enable_layernorm_sp=False,
+        ):
+            layer = mock.MagicMock(spec=Qwen4ExpAttentionDecoderLayer)
+            layer.is_qsa = is_qsa
+            layer.ple = ple
+            draft = SimpleNamespace(
+                model=SimpleNamespace(
+                    layers=[layer] * num_layers,
+                    pp_group=SimpleNamespace(is_first_rank=is_first_rank),
+                )
+            )
+            with mock.patch(
+                "sglang.srt.models.qwen4_exp_mtp.get_parallel",
+                return_value=SimpleNamespace(enable_layernorm_sp=enable_layernorm_sp),
+            ):
+                return Qwen4ExpForCausalLMMTP.supports_forward_kv_only(
+                    draft, kv_cache_dtype=kv_cache_dtype
+                )
+
+        self.assertTrue(_check(kv_cache_dtype=torch.bfloat16))
+        self.assertTrue(_check(kv_cache_dtype=torch.float8_e4m3fn))
+        self.assertFalse(_check(is_qsa=False))
+        self.assertFalse(_check(ple=object()))
+        self.assertFalse(_check(num_layers=2))
+        self.assertFalse(_check(is_first_rank=False))
+        self.assertFalse(_check(enable_layernorm_sp=True))
 
 
 def _can_split(*, kv_cache_dtype, prefill, dcp=False, return_indexer_topk=False):
@@ -336,6 +414,34 @@ class TestCanSplitPrefillDraftExtend(CustomTestCase):
         self.assertFalse(
             _can_split(kv_cache_dtype=torch.bfloat16, prefill="tilelang", dcp=True)
         )
+
+    def test_qwen4_mtp_can_split_sets_flag_and_respects_parallel_gates(self):
+        def _run_qwen4(*, kv_cache_dtype=torch.float8_e4m3fn, dcp=False, topk=False):
+            draft = mock.MagicMock(spec=Qwen4ExpForCausalLMMTP)
+            draft.supports_forward_kv_only.return_value = True
+            worker = SimpleNamespace(
+                draft_runner=SimpleNamespace(model=draft, kv_cache_dtype=kv_cache_dtype)
+            )
+            exec_ = SimpleNamespace(
+                kernel=SimpleNamespace(dsa_prefill_backend="flashmla_auto"),
+                features=SimpleNamespace(enable_return_indexer_topk=topk),
+            )
+            parallel = SimpleNamespace(
+                attn_dp_enabled=False, enable_prefill_cp=False, dcp_enabled=dcp
+            )
+            with mock.patch.multiple(
+                "sglang.srt.speculative.eagle_worker_v2",
+                _is_cuda=True,
+                get_exec=mock.Mock(return_value=exec_),
+                get_parallel=mock.Mock(return_value=parallel),
+            ):
+                can_split = EagleDraftWorker._can_split_prefill_draft_extend(worker)
+            return can_split, worker._split_prefill_is_qsa_mtp
+
+        self.assertEqual(_run_qwen4(kv_cache_dtype=torch.float8_e4m3fn), (True, True))
+        self.assertEqual(_run_qwen4(kv_cache_dtype=torch.bfloat16), (True, True))
+        self.assertEqual(_run_qwen4(dcp=True), (False, False))
+        self.assertEqual(_run_qwen4(topk=True), (False, False))
 
 
 if __name__ == "__main__":

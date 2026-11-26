@@ -2382,6 +2382,43 @@ class Qwen4ExpAttentionDecoderLayer(
         output, _ = self.o_proj(attn_output)
         return output
 
+    def forward_kv_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Populate KV cache and QSA compressed indexer state without running
+        attention, o_proj, HC combine, or FFN/MoE (used by split MTP draft extend)."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        from sglang.srt.layers.attention.qsa.glue import (
+            get_qsa_indexer_metadata,
+            resolve_qsa_sparse_backend,
+        )
+
+        hidden_states = self._widen_streams(hidden_states)
+        norm_hidden = self.attn_hyper_connection.mix(hidden_states)[0]
+        _, k, v, _ = self._prepare_qkv_gate(
+            positions=positions,
+            hidden_states=norm_hidden,
+            forward_batch=forward_batch,
+        )
+        backend = get_attn_backend()
+        sparse_backend = resolve_qsa_sparse_backend(backend)
+        k_3d = k.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim)
+        v_3d = v.view(-1, self.attn.tp_v_head_num, self.attn.v_head_dim)
+        sparse_backend.kv_layers.layer(self.layer_id).store(
+            self.attn, forward_batch.out_cache_loc, k_3d, v_3d
+        )
+        if self.is_qsa:
+            indexer_metadata = get_qsa_indexer_metadata(
+                backend, self.layer_id, forward_batch
+            )
+            self.indexer.forward_kv_only(
+                norm_hidden, positions, forward_batch, indexer_metadata
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2600,6 +2637,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Single-layer MTP draft KV-only pass: writes KV & QSA indexer state."""
+        assert len(self.layers) == 1 and self.start_layer == 0 and self.end_layer == 1
+        hidden_states = (
+            inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        )
+        self.layers[0].forward_kv_only(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
