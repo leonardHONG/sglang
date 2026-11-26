@@ -417,6 +417,43 @@ def test_gated_residual_batch_invariant_across_256_threshold(monkeypatch):
     assert torch.equal(out_256[0], out_257[0])
 
 
+def test_gated_residual_direct_weight_update_rejected_and_default_refresh_updates_packed_up():
+    """Regression: load_format='direct' bypasses prepare_fused_weights(), so once
+    packed up-weights are active it must be rejected via _direct_weight_update_error,
+    while the default loader's prepare_fused_weights() refreshes packed weights in place."""
+    from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        _direct_weight_update_error,
+    )
+
+    cfg = HyperConnectionConfig(
+        hc_count=4,
+        hidden_size=512,
+        params_dtype=torch.bfloat16,
+        hc_lowrank=16,
+        hc_per_branch_norm=True,
+    )
+    hc = GatedResidual(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+    assert _direct_weight_update_error(hc) is None
+
+    with torch.no_grad():
+        hc.input_mix_weight_up.weight.data.fill_(1.0)
+        hc.prepare_fused_weights()
+    err = _direct_weight_update_error(hc)
+    assert err is not None and "direct" in err
+    packed_ptr = hc._packed_up_weight.data_ptr()
+    assert torch.all(hc._get_packed_up_weight() == 1.0)
+
+    # Default load_weights calls prepare_fused_weights(), refreshing in place.
+    with torch.no_grad():
+        hc.input_mix_weight_up.weight.data.copy_(
+            torch.full_like(hc.input_mix_weight_up.weight.data, 7.0)
+        )
+        hc.prepare_fused_weights()
+    assert hc._packed_up_weight.data_ptr() == packed_ptr
+    assert torch.all(hc._get_packed_up_weight() == 7.0)
+
+
 if __name__ == "__main__":
     import sys
 

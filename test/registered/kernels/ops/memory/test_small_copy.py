@@ -420,45 +420,6 @@ class TestSmallFieldCopy(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(dst_idx, idx.long()))
 
-    def test_try_small_field_copy_reuses_tls_buffer_and_respects_env_gate(self):
-        from sglang.kernels.ops.memory.small_field_copy import (
-            _TLS,
-            try_small_field_copy,
-        )
-        from sglang.srt.environ import envs
-        from sglang.srt.model_executor import cuda_graph_buffer_registry as reg_mod
-        from sglang.srt.model_executor.runner_utils import buffers as buf_mod
-
-        d0 = torch.zeros(16, device="cuda", dtype=torch.int64)
-        d1 = torch.zeros(16, device="cuda", dtype=torch.int32)
-        s0 = torch.arange(16, device="cuda", dtype=torch.int32)
-        s1 = torch.arange(16, 32, device="cuda", dtype=torch.int32)
-        self.assertTrue(try_small_field_copy([d0, d1], [s0, s1]))
-        buf_first = getattr(_TLS, "desc_buf", None)
-        self.assertIsNotNone(buf_first)
-        ptr_first = buf_first.data_ptr()
-        s0.add_(5)
-        s1.add_(7)
-        self.assertTrue(try_small_field_copy([d0, d1], [s0, s1]))
-        self.assertEqual(_TLS.desc_buf.data_ptr(), ptr_first)
-        self.assertTrue(torch.equal(d0, s0.long()))
-        self.assertTrue(torch.equal(d1, s1))
-
-        # Gated off by default unless SGLANG_OPT_SMALL_FIELD_COPY is enabled.
-        for mod in (reg_mod, buf_mod):
-            with (
-                envs.SGLANG_OPT_SMALL_FIELD_COPY.override(False),
-                mock.patch(
-                    "sglang.kernels.ops.memory.small_field_copy.try_small_field_copy",
-                    side_effect=AssertionError("must not call when gated off"),
-                ),
-            ):
-                d0.zero_()
-                d1.zero_()
-                mod._grouped_foreach_copy_([d0, d1], [s0, s1])
-                self.assertTrue(torch.equal(d0, s0.long()))
-                self.assertTrue(torch.equal(d1, s1))
-
 
 if __name__ == "__main__":
     unittest.main()

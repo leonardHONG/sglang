@@ -819,3 +819,99 @@ def test_mtp_split_last_token_draft_extend_v2_layout_and_attention_matches_eager
             assert int(share_g.captured_len[0, r]) == int(share_e.captured_len[0, r])
         # Slot 0 must remain untouched (padding routed to trash_row).
         assert int(share_g.captured_len[0, 0]) == 1
+
+
+def test_qsa_graph_metadata_triton_single_compile_across_bs_and_alignment():
+    """Verify QSA graph metadata Triton kernels compile exactly once across
+    varying batch sizes, padding counts, and unaligned pointer slices."""
+    import triton
+
+    from sglang.srt.layers.attention.qsa.graph_metadata import (
+        _qsa_draft_graph_metadata_kernel,
+        _qsa_graph_layout_kernel,
+        _qsa_graph_row_metadata_kernel,
+    )
+
+    device = "cuda"
+    max_bs, max_rows, max_pages, ratio, full_page = 64, 256, 64, 4, 64
+    req_to_token = torch.arange(
+        128 * 4096, dtype=torch.int32, device=device
+    ).reshape(128, 4096)
+
+    def _bufs():
+        return (
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+            torch.zeros((max_rows, max_pages), dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int64, device=device),
+            torch.zeros((max_rows, ratio), dtype=torch.int32, device=device),
+            torch.zeros(max_rows, dtype=torch.int32, device=device),
+        )
+
+    b0 = _bufs()
+    draft_bufs = (_bufs(), _bufs())
+    seq_base = torch.full((max_bs + 5,), 128, dtype=torch.int64, device=device)
+    req_base = torch.arange(1, max_bs + 6, dtype=torch.int64, device=device)
+    ext_base = torch.full((max_bs + 5,), 2, dtype=torch.int32, device=device)
+
+    for fn in (
+        _qsa_graph_layout_kernel,
+        _qsa_graph_row_metadata_kernel,
+        _qsa_draft_graph_metadata_kernel,
+    ):
+        fn.device_caches.clear()
+
+    for shift in (0, 1):
+        for bs, pad in ((64, 0), (64, 1), (48, 3), (32, 0), (16, 1), (8, 0), (1, 0)):
+            sl = seq_base[shift : shift + bs]
+            rp = req_base[shift : shift + bs]
+            ex = ext_base[shift : shift + bs]
+            nr = bs * 4
+            _qsa_graph_layout_kernel[(bs + 1,)](
+                sl, rp, ex, b0[0], b0[8], b0[1], bs, nr, pad, num_warps=1
+            )
+            _qsa_graph_row_metadata_kernel[(nr, triton.cdiv(max_pages, 128))](
+                b0[0],
+                b0[1],
+                b0[2],
+                b0[3],
+                b0[4],
+                b0[5],
+                b0[6],
+                b0[7],
+                req_to_token,
+                req_to_token.stride(0),
+                max_pages,
+                RATIO=ratio,
+                FULL_PAGE=full_page,
+                PAGE_BLOCK=128,
+                seq_lens_ptr=sl,
+                req_pool_ptr=rp,
+                row_prefix_lens_ptr=b0[8],
+                bs=bs,
+                num_padding=pad,
+                extend_len=4,
+                seq_offset=0,
+                MODE=2,
+                num_warps=1,
+            )
+            _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), 2)](
+                draft_bufs,
+                sl,
+                rp,
+                req_to_token,
+                req_to_token.stride(0),
+                bs,
+                pad,
+                max_pages,
+                ratio,
+                full_page,
+                num_warps=1,
+            )
+    torch.cuda.synchronize()
+    assert len(_qsa_graph_layout_kernel.device_caches[0][0]) == 1
+    assert len(_qsa_graph_row_metadata_kernel.device_caches[0][0]) == 1
+    assert len(_qsa_draft_graph_metadata_kernel.device_caches[0][0]) == 1

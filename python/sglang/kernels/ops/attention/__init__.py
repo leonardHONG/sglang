@@ -95,15 +95,6 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="attention.qsa_graph_metadata",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.attention.qsa_graph_metadata:run_jit_qsa_graph_metadata",
-        capabilities=CUDA_ONLY,
-    )
-)
-
-register_kernel(
-    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),

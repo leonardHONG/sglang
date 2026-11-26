@@ -17,41 +17,13 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_hc_combine_module(
-    hc_count: int, hidden_size: int, dtype: torch.dtype
+    hc_count: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    *,
+    include_split: bool = True,
 ) -> Module:
     """Compile and cache the JIT HC combine module for a given shape/dtype."""
-    # Validation lives here rather than in `hc_combine`,
-    # so `cache_once` runs it once per (hc_count, hidden_size, dtype), not per call.
-    if dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
-    if hidden_size <= 0 or hidden_size % 8 != 0:
-        raise RuntimeError(
-            f"Unsupported hidden_size {hidden_size}. Must be a multiple of 8."
-        )
-    if hc_count <= 0 or (hc_count * hidden_size) % 2048 != 0:
-        raise RuntimeError(
-            f"Unsupported hc_count * hidden_size {hc_count * hidden_size}. "
-            "Must be a multiple of 2048."
-        )
-    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
-    return load_jit(
-        "hc_combine",
-        *args,
-        cuda_files=["elementwise/hc_combine.cuh"],
-        cuda_wrappers=[
-            ("hc_combine", f"HcCombineKernel<{args}>::run"),
-            ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
-            ("hc_combine_logits", f"HcCombineLogitsKernel<{args}>::run"),
-            ("hc_combine_logits_norm", f"HcCombineLogitsKernel<{args}>::run_norm"),
-        ],
-    )
-
-
-@cache_once
-def _jit_hc_combine_logits_module(
-    hc_count: int, hidden_size: int, dtype: torch.dtype
-) -> Module:
-    """Compile and cache the logits-based HC combine module for general H % 8 == 0."""
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if hidden_size <= 0 or hidden_size % 8 != 0:
@@ -60,23 +32,44 @@ def _jit_hc_combine_logits_module(
         )
     if hc_count <= 0:
         raise RuntimeError(f"Unsupported hc_count {hc_count}. Must be positive.")
+    if include_split and (hc_count * hidden_size) % 2048 != 0:
+        raise RuntimeError(
+            f"Unsupported hc_count * hidden_size {hc_count * hidden_size}. "
+            "Must be a multiple of 2048."
+        )
+    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
+    wrappers = [
+        ("hc_combine_logits", f"HcCombineLogitsKernel<{args}>::run"),
+        ("hc_combine_logits_norm", f"HcCombineLogitsKernel<{args}>::run_norm"),
+    ]
+    if include_split:
+        wrappers = [
+            ("hc_combine", f"HcCombineKernel<{args}>::run"),
+            ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
+            *wrappers,
+        ]
+    return load_jit(
+        "hc_combine" if include_split else "hc_combine_logits",
+        *args,
+        cuda_files=["elementwise/hc_combine.cuh"],
+        cuda_wrappers=wrappers,
+    )
+
+
+def _jit_hc_combine_logits_module(
+    hc_count: int, hidden_size: int, dtype: torch.dtype
+) -> Module:
     vecs = (hc_count * hidden_size) // 8
     split_ok = (
-        (hc_count * hidden_size) % 2048 == 0
+        hc_count > 0
+        and hidden_size > 0
+        and hidden_size % 8 == 0
+        and (hc_count * hidden_size) % 2048 == 0
         and vecs % (8 * 160) == 0
         and (hidden_size // 8) % (vecs // 8) == 0
     )
-    if split_ok:
-        return _jit_hc_combine_module(hc_count, hidden_size, dtype)
-    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
-    return load_jit(
-        "hc_combine_logits",
-        *args,
-        cuda_files=["elementwise/hc_combine.cuh"],
-        cuda_wrappers=[
-            ("hc_combine_logits", f"HcCombineLogitsKernel<{args}>::run"),
-            ("hc_combine_logits_norm", f"HcCombineLogitsKernel<{args}>::run_norm"),
-        ],
+    return _jit_hc_combine_module(
+        hc_count, hidden_size, dtype, include_split=split_ok
     )
 
 

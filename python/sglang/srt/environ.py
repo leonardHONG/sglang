@@ -734,6 +734,9 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # Small chunk overflow tolerance (tokens) in PrefillAdder to avoid splitting tiny tail chunks.
+    # None (default): auto-enabled only for Qwen4-Exp (QSA) models; 0: disabled; >0: explicit token cap.
+    SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE = EnvInt(None)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1825,18 +1828,10 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
-    # Use the JIT CUDA small_field_copy kernel in _grouped_foreach_copy_ instead of
-    # the Triton small_copy fallback to avoid Triton recompilation across batch sizes.
-    SGLANG_OPT_SMALL_FIELD_COPY = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Small chunk overflow tolerance (tokens) in PrefillAdder to avoid splitting tiny tail chunks.
-    # -1 (default): auto-enabled only for Qwen4-Exp (QSA) models; 0: disabled; >0: explicit token cap.
-    SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE = EnvInt(-1)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.

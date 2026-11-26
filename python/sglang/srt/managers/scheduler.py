@@ -4716,34 +4716,29 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        tail_split_tolerance = 0
-        if (
-            chunked_prefill_size is not None
-            and self.dllm_config is None
-            and self.dynamic_chunk_sizer is None
-            and not self.is_mixed_chunk
-            and not self.model_config.use_ngram_embedding
-            and getattr(attn_backend, "prefill_kernel_max_seqlen_q_grid", None) is None
-        ):
-            from sglang.srt.arg_groups.overrides import prefill_chunk_tail_tolerance
+        from sglang.srt.arg_groups.overrides import (
+            resolve_prefill_tail_split_tolerance,
+        )
 
-            tail_split_tolerance = prefill_chunk_tail_tolerance(self.server_args)
-            # Never exceed the prefill buffer ceiling that workspaces allocated for.
-            buffer_ceiling = max_prefill_buffer_tokens()
-            if buffer_ceiling > 0:
-                tail_split_tolerance = min(
-                    tail_split_tolerance,
-                    max(0, buffer_ceiling - chunked_prefill_size),
-                )
-            prefill_graph_runner = (
-                self.tp_worker.model_runner.prefill_cuda_graph_runner
-            )
-            graph_max_tokens = getattr(prefill_graph_runner, "max_num_tokens", None)
-            if graph_max_tokens is not None:
-                tail_split_tolerance = min(
-                    tail_split_tolerance,
-                    max(0, graph_max_tokens - chunked_prefill_size),
-                )
+        tail_split_tolerance = resolve_prefill_tail_split_tolerance(
+            server_args=self.server_args,
+            chunked_prefill_size=chunked_prefill_size,
+            token_budget=token_budget,
+            buffer_ceiling=max_prefill_buffer_tokens(),
+            graph_max_tokens=getattr(
+                self.tp_worker.model_runner.prefill_cuda_graph_runner,
+                "max_num_tokens",
+                None,
+            ),
+            dllm_enabled=self.dllm_config is not None,
+            dynamic_chunking=self.dynamic_chunk_sizer is not None,
+            is_mixed_chunk=self.is_mixed_chunk,
+            use_ngram_embedding=self.model_config.use_ngram_embedding,
+            has_max_seqlen_q_grid=(
+                getattr(attn_backend, "prefill_kernel_max_seqlen_q_grid", None)
+                is not None
+            ),
+        )
 
         adder = self.get_prefill_adder_class()(
             self.page_size,

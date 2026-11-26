@@ -926,20 +926,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         ssm_pool_dtype = self.state_pool.mamba_cache.temporal.dtype
         for _, num_v_heads, head_k_dim, head_v_dim in geometries:
-            dummy_ssm = torch.zeros(
+            dummy_ssm_src = torch.zeros(
                 (2, num_v_heads, head_v_dim, head_k_dim),
                 dtype=ssm_pool_dtype,
                 device=device,
             )
+            dummy_ssm_dst = torch.zeros_like(dummy_ssm_src)
             for idx_dtype in (torch.int32, torch.int64):
                 idx0 = torch.zeros((1,), dtype=idx_dtype, device=device)
                 idx1 = torch.ones((1,), dtype=idx_dtype, device=device)
-                copy_indexed_ssm_rows(dummy_ssm, idx0, dummy_ssm, idx1)
+                assert copy_indexed_ssm_rows(dummy_ssm_src, idx0, dummy_ssm_dst, idx1)
             # Also warm mixed int64 src + int32 dst (FlashInfer checkpoint tracking).
-            copy_indexed_ssm_rows(
-                dummy_ssm,
+            assert copy_indexed_ssm_rows(
+                dummy_ssm_src,
                 torch.zeros((1,), dtype=torch.int64, device=device),
-                dummy_ssm,
+                dummy_ssm_dst,
                 torch.ones((1,), dtype=torch.int32, device=device),
             )
         if conv_prewarmed:

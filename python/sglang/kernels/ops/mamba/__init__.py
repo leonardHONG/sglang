@@ -100,6 +100,8 @@ for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
+    ("mamba_state_scatter_triton", "copy_indexed_ssm_rows"),
+    ("mamba_state_scatter_triton", "scatter_conv_track_rows"),
 ]:
     register_kernel(
         KernelSpec(

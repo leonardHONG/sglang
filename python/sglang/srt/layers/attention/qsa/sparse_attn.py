@@ -735,6 +735,80 @@ def _can_use_fp8_pairs(
     return True, packed, aligned_8
 
 
+def _launch_chunk_prefill_fp8_pairs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    gate_arg: torch.Tensor,
+    indices: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    kv_lens: torch.Tensor,
+    scale: float,
+    *,
+    max_q: int,
+    num_entries: int,
+    num_kv_heads: int,
+    group_size: int,
+    block_m: int,
+    head_dim: int,
+    has_gate: bool,
+    slot_indices: bool,
+    packed_pairs: bool,
+    aligned_8: bool,
+) -> None:
+    if not packed_pairs:
+        k, v = k.contiguous(), v.contiguous()
+        _, _, aligned_8 = _can_use_fp8_pairs(q, k, v)
+    k_arg = k.view(torch.int16)
+    v_arg = v.view(torch.int16)
+    block_n, warps, stages = _get_fp8_pairs_config(q.shape[0])
+    _sparse_gqa_chunk_prefill_fp8_pairs[(max_q, num_entries * num_kv_heads)](
+        q,
+        k_arg,
+        v_arg,
+        out,
+        gate_arg,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_arg.stride(0),
+        k_arg.stride(1),
+        k_arg.stride(2),
+        v_arg.stride(0),
+        v_arg.stride(1),
+        v_arg.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        gate_arg.stride(0) if has_gate else 0,
+        gate_arg.stride(1) if has_gate else 0,
+        gate_arg.stride(2) if has_gate else 0,
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        HALF_DIM=head_dim // 2,
+        NUM_STAGES=stages,
+        SLOT_INDICES=slot_indices,
+        HAS_GATE=has_gate,
+        ALIGNED_8=aligned_8,
+        num_warps=warps,
+        num_stages=stages,
+    )
+
+
 def sparse_gqa_fwd_interface_triton_ck(
     q,
     k,
@@ -764,16 +838,10 @@ def sparse_gqa_fwd_interface_triton_ck(
     gate_arg = gate_3d if has_gate else q
     use_fp8_pairs, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k, v)
     if use_fp8_pairs:
-        if not packed_pairs:
-            k, v = k.contiguous(), v.contiguous()
-            _, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k, v)
-        k_arg = k.view(torch.int16)
-        v_arg = v.view(torch.int16)
-        block_n, warps, stages = _get_fp8_pairs_config(total_q)
-        _sparse_gqa_chunk_prefill_fp8_pairs[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
+        _launch_chunk_prefill_fp8_pairs(
             q,
-            k_arg,
-            v_arg,
+            k,
+            v,
             out,
             gate_arg,
             indices,
@@ -781,37 +849,16 @@ def sparse_gqa_fwd_interface_triton_ck(
             cu_k,
             kv_lens,
             scale,
-            indices.shape[-1],
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_arg.stride(0),
-            k_arg.stride(1),
-            k_arg.stride(2),
-            v_arg.stride(0),
-            v_arg.stride(1),
-            v_arg.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            gate_arg.stride(0) if has_gate else 0,
-            gate_arg.stride(1) if has_gate else 0,
-            gate_arg.stride(2) if has_gate else 0,
-            indices.stride(0),
-            indices.stride(1) if indices.ndim == 3 else 0,
-            indices.stride(2) if indices.ndim == 3 else indices.stride(1),
-            NUM_KV_HEADS=num_kv_heads,
-            GROUP_SIZE=group_size,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            HEAD_DIM=head_dim,
-            HALF_DIM=head_dim // 2,
-            NUM_STAGES=stages,
-            SLOT_INDICES=False,
-            HAS_GATE=has_gate,
-            ALIGNED_8=aligned_8,
-            num_warps=warps,
-            num_stages=stages,
+            max_q=max_q,
+            num_entries=cu_q.shape[0] - 1,
+            num_kv_heads=num_kv_heads,
+            group_size=group_size,
+            block_m=block_m,
+            head_dim=head_dim,
+            has_gate=has_gate,
+            slot_indices=False,
+            packed_pairs=packed_pairs,
+            aligned_8=aligned_8,
         )
         return out
     block_n, warps, stages = _get_best_config(total_q, is_fp8=k.element_size() == 1)
@@ -1007,18 +1054,10 @@ def sparse_gqa_paged_prefill_triton(
 
     use_fp8_pairs, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k_cache, v_cache)
     if use_fp8_pairs:
-        if not packed_pairs:
-            # Non-unit inner stride (e.g., synthetic strided test views); production
-            # KV pools are always contiguous along head_dim so this copy is skipped.
-            k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
-            _, packed_pairs, aligned_8 = _can_use_fp8_pairs(q, k_cache, v_cache)
-        k_arg = k_cache.view(torch.int16)
-        v_arg = v_cache.view(torch.int16)
-        block_n, warps, stages = _get_fp8_pairs_config(total_q)
-        _sparse_gqa_chunk_prefill_fp8_pairs[(max_q, num_entries * num_kv_heads)](
+        _launch_chunk_prefill_fp8_pairs(
             q,
-            k_arg,
-            v_arg,
+            k_cache,
+            v_cache,
             out,
             gate_arg,
             slots,
@@ -1026,37 +1065,16 @@ def sparse_gqa_paged_prefill_triton(
             cu_q,
             kv_lens,
             scale,
-            topk,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_arg.stride(0),
-            k_arg.stride(1),
-            k_arg.stride(2),
-            v_arg.stride(0),
-            v_arg.stride(1),
-            v_arg.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            gate_arg.stride(0) if has_gate else 0,
-            gate_arg.stride(1) if has_gate else 0,
-            gate_arg.stride(2) if has_gate else 0,
-            slots.stride(0),
-            0,
-            slots.stride(1),
-            NUM_KV_HEADS=num_kv_heads,
-            GROUP_SIZE=group_size,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            HEAD_DIM=head_dim,
-            HALF_DIM=head_dim // 2,
-            NUM_STAGES=stages,
-            SLOT_INDICES=True,
-            HAS_GATE=has_gate,
-            ALIGNED_8=aligned_8,
-            num_warps=warps,
-            num_stages=stages,
+            max_q=max_q,
+            num_entries=num_entries,
+            num_kv_heads=num_kv_heads,
+            group_size=group_size,
+            block_m=block_m,
+            head_dim=head_dim,
+            has_gate=has_gate,
+            slot_indices=True,
+            packed_pairs=packed_pairs,
+            aligned_8=aligned_8,
         )
         return out
 

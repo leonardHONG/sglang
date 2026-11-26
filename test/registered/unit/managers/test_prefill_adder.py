@@ -3153,6 +3153,7 @@ class TestPrefillAdder(CustomTestCase):
         from sglang.srt.arg_groups.overrides import (
             max_prefill_buffer_tokens,
             prefill_chunk_tail_tolerance,
+            resolve_prefill_tail_split_tolerance,
         )
         from sglang.srt.environ import envs
 
@@ -3183,7 +3184,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         with (
-            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(None),
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
                 return_value=llama_cfg,
@@ -3194,7 +3195,7 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(max_prefill_buffer_tokens(args), 16384)
 
         with (
-            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+            envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(None),
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
                 return_value=qwen4_cfg,
@@ -3203,6 +3204,54 @@ class TestPrefillAdder(CustomTestCase):
             args = make_args(16384)
             self.assertEqual(prefill_chunk_tail_tolerance(args), 256)
             self.assertEqual(max_prefill_buffer_tokens(args), 16640)
+            # Policy-tightened token_budget (e.g. shortest-prefill lowering to 4096)
+            # must NEVER be exceeded by tail-split tolerance.
+            tol_tight = resolve_prefill_tail_split_tolerance(
+                server_args=args,
+                chunked_prefill_size=4096,
+                token_budget=4096,
+                buffer_ceiling=16640,
+                graph_max_tokens=16640,
+                dllm_enabled=False,
+                dynamic_chunking=False,
+                is_mixed_chunk=False,
+                use_ngram_embedding=False,
+                has_max_seqlen_q_grid=False,
+            )
+            self.assertEqual(tol_tight, 0)
+            self.mock_token_allocator.available_size.return_value = 200_000
+            adder_tight = self.create_adder(
+                self.create_running_batch(),
+                page_size=64,
+                rem_input_tokens=4096,
+                rem_chunk_tokens=4096,
+                tail_split_tolerance=tol_tight,
+            )
+            req_4224 = self.create_mock_req("r4224", priority=0, max_new_tokens=128)
+            req_4224.prefix_len = 0
+            req_4224.full_untruncated_fill_ids = list(range(4224))
+            req_4224.origin_input_ids = list(range(4224))
+            adder_tight.add_one_req(
+                req_4224, has_chunked_req=False, truncation_align_size=None
+            )
+            self.assertIs(adder_tight.new_chunked_req, req_4224)
+            self.assertEqual(req_4224.extend_end, 4096)
+            # When policy did not tighten token_budget, configured 16384 gets 256.
+            self.assertEqual(
+                resolve_prefill_tail_split_tolerance(
+                    server_args=args,
+                    chunked_prefill_size=16384,
+                    token_budget=None,
+                    buffer_ceiling=16640,
+                    graph_max_tokens=16640,
+                    dllm_enabled=False,
+                    dynamic_chunking=False,
+                    is_mixed_chunk=False,
+                    use_ngram_embedding=False,
+                    has_max_seqlen_q_grid=False,
+                ),
+                256,
+            )
 
         with (
             envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(0),
@@ -3229,7 +3278,7 @@ class TestPrefillAdder(CustomTestCase):
         try:
             publish(sa, role="test")
             with (
-                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(None),
                 patch(
                     "sglang.srt.arg_groups.overrides.model_config_of",
                     return_value=qwen4_cfg,
@@ -3237,7 +3286,7 @@ class TestPrefillAdder(CustomTestCase):
             ):
                 self.assertEqual(rc_max_prefill_buffer_tokens(), 16640)
             with (
-                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(None),
                 patch(
                     "sglang.srt.arg_groups.overrides.model_config_of",
                     return_value=llama_cfg,

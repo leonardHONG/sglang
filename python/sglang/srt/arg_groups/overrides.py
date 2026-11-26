@@ -2187,7 +2187,7 @@ def prefill_chunk_tail_tolerance(server_args: Any) -> int:
     consistently to ``chunked_prefill_size + tolerance``.
 
     Controlled by ``SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE``:
-    - ``-1`` (default): auto-enabled only for Qwen4-Exp (QSA) models;
+    - ``None`` (default): auto-enabled only for Qwen4-Exp (QSA) models;
     - ``0``: disabled for all models;
     - ``> 0``: explicit token cap (clamped to ``chunked_prefill_size // 32``).
     """
@@ -2207,12 +2207,9 @@ def prefill_chunk_tail_tolerance(server_args: Any) -> int:
         return 0
 
     override = envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.get()
-    if override == 0:
-        return 0
-
     max_allowed = min(PREFILL_CHUNK_TAIL_TOLERANCE_MAX, chunked // 32)
-    if override > 0:
-        return min(override, max_allowed)
+    if override is not None:
+        return min(override, max_allowed) if override > 0 else 0
 
     from sglang.srt.configs.model_config import is_qwen4_exp
 
@@ -2223,6 +2220,46 @@ def prefill_chunk_tail_tolerance(server_args: Any) -> int:
     if model_config is None or not is_qwen4_exp(model_config.hf_config):
         return 0
     return max_allowed
+
+
+def resolve_prefill_tail_split_tolerance(
+    *,
+    server_args: Any,
+    chunked_prefill_size: Optional[int],
+    token_budget: Optional[int],
+    buffer_ceiling: int,
+    graph_max_tokens: Optional[int],
+    dllm_enabled: bool,
+    dynamic_chunking: bool,
+    is_mixed_chunk: bool,
+    use_ngram_embedding: bool,
+    has_max_seqlen_q_grid: bool,
+) -> int:
+    """Compute effective per-round tail-split tolerance for ``PrefillAdder``.
+
+    Never exceeds the workspace ceiling, captured prefill graph limit, or a
+    per-round ``token_budget`` tightened by the scheduling policy (e.g.,
+    ``shortest-prefill`` load adaptation).
+    """
+    if (
+        chunked_prefill_size is None
+        or dllm_enabled
+        or dynamic_chunking
+        or is_mixed_chunk
+        or use_ngram_embedding
+        or has_max_seqlen_q_grid
+    ):
+        return 0
+    tolerance = prefill_chunk_tail_tolerance(server_args)
+    if tolerance <= 0:
+        return 0
+    if token_budget is not None:
+        tolerance = min(tolerance, max(0, token_budget - chunked_prefill_size))
+    if buffer_ceiling > 0:
+        tolerance = min(tolerance, max(0, buffer_ceiling - chunked_prefill_size))
+    if graph_max_tokens is not None:
+        tolerance = min(tolerance, max(0, graph_max_tokens - chunked_prefill_size))
+    return tolerance
 
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:

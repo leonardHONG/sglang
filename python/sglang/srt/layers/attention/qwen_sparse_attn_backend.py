@@ -3193,6 +3193,7 @@ def prewarm_qsa_prefill_kernels(
         if isinstance(m, QSAIndexer)
     }
     scoring_dtype = pool.qsa_compressed_dtype
+    triton_prefill_geoms: set[tuple[int, int, int]] = set()
     if indexer_geoms and attn_geoms and hasattr(pool, "get_qsa_compressed_k_buffer"):
         first_layer_id = next(iter(attn_geoms.values()))
         try:
@@ -3214,6 +3215,7 @@ def prewarm_qsa_prefill_kernels(
                 if can_use_triton_qsa_mqa_paged_prefill(
                     q_idx, comp_buf, paged_slot_table
                 ):
+                    triton_prefill_geoms.add((index_n_heads, index_head_dim, block_topk))
                     tok_batch = torch.zeros(32, dtype=torch.int32, device=device)
                     row_lens = torch.ones(32, dtype=torch.int32, device=device)
                     for min_len in (block_topk, 0):
@@ -3258,7 +3260,8 @@ def prewarm_qsa_prefill_kernels(
                                     )
                                     runs += 1
 
-    if HAS_TILELANG:
+    tilelang_prefill_geoms = indexer_geoms - triton_prefill_geoms
+    if HAS_TILELANG and tilelang_prefill_geoms:
         from sglang.srt.layers.attention.qsa.mqa import (
             _PREFILL_KEY_SPLIT_LEVELS,
             _num_sms,
@@ -3266,7 +3269,7 @@ def prewarm_qsa_prefill_kernels(
         )
 
         num_sms = _num_sms(device.index or 0)
-        for index_n_heads, index_head_dim, block_topk in indexer_geoms:
+        for index_n_heads, index_head_dim, block_topk in tilelang_prefill_geoms:
             block_q = max(1, 128 // index_n_heads)
             block_n = 64
             min_scored_len = QSAIndexer.prefill_min_scored_len(block_topk)

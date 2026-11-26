@@ -196,6 +196,7 @@ class GatedResidual(HyperConnectionBase):
         self._fused_down_gate_weight = None
         self._packed_up_weight = None
         self._packed_up_weight_key = None
+        self._direct_weight_update_error: Optional[str] = None
         self._jit_combine_logits_ok = False
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -419,6 +420,10 @@ class GatedResidual(HyperConnectionBase):
         if not torch.cuda.is_current_stream_capturing():
             self._packed_up_weight = packed
             self._packed_up_weight_key = key
+            self._direct_weight_update_error = (
+                "load_format='direct' does not refresh HyperConnection packed "
+                "up-weights; update weights with the default load format."
+            )
         return packed
 
     def _flydsl_mix_ok(self) -> bool:
