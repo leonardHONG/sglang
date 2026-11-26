@@ -3215,6 +3215,38 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(prefill_chunk_tail_tolerance(args), 0)
             self.assertEqual(max_prefill_buffer_tokens(args), 16384)
 
+        # Post-publish runtime_context.max_prefill_buffer_tokens() must match
+        # overrides.max_prefill_buffer_tokens(server_args) so every runtime
+        # workspace and Scheduler agree on the exact same ceiling.
+        from sglang.srt.runtime_context import (
+            max_prefill_buffer_tokens as rc_max_prefill_buffer_tokens,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        sa = ServerArgs(model_path="dummy", chunked_prefill_size=16384)
+        try:
+            publish(sa, role="test")
+            with (
+                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+                patch(
+                    "sglang.srt.arg_groups.overrides.model_config_of",
+                    return_value=qwen4_cfg,
+                ),
+            ):
+                self.assertEqual(rc_max_prefill_buffer_tokens(), 16640)
+            with (
+                envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
+                patch(
+                    "sglang.srt.arg_groups.overrides.model_config_of",
+                    return_value=llama_cfg,
+                ),
+            ):
+                self.assertEqual(rc_max_prefill_buffer_tokens(), 16384)
+        finally:
+            reset_context()
+
 
 if __name__ == "__main__":
     unittest.main()

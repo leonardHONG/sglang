@@ -1816,6 +1816,10 @@ def max_prefill_buffer_tokens() -> int:
         else 0
     )
     tokens = chunked
+    if chunked:
+        from sglang.srt.arg_groups.overrides import prefill_chunk_tail_tolerance
+
+        tokens += prefill_chunk_tail_tolerance(get_server_args())
     if schedule.enable_dynamic_chunking and get_parallel().pp_size > 1 and chunked:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
