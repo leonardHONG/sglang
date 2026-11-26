@@ -3169,11 +3169,17 @@ class TestPrefillAdder(CustomTestCase):
                 enable_deterministic_inference=False,
             )
 
-        qsa_cfg = SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="qwen4_exp", qsa_compress_ratio=16)
+        qwen4_cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen4ExpForConditionalGeneration"],
+                model_type="qwen4_exp",
+            )
         )
         llama_cfg = SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="llama")
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                model_type="llama",
+            )
         )
 
         with (
@@ -3181,10 +3187,6 @@ class TestPrefillAdder(CustomTestCase):
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
                 return_value=llama_cfg,
-            ),
-            patch(
-                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
-                return_value=False,
             ),
         ):
             args = make_args(16384)
@@ -3195,11 +3197,7 @@ class TestPrefillAdder(CustomTestCase):
             envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(-1),
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
-                return_value=qsa_cfg,
-            ),
-            patch(
-                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
-                return_value=True,
+                return_value=qwen4_cfg,
             ),
         ):
             args = make_args(16384)
@@ -3210,11 +3208,7 @@ class TestPrefillAdder(CustomTestCase):
             envs.SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE.override(0),
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
-                return_value=qsa_cfg,
-            ),
-            patch(
-                "sglang.srt.configs.model_config.uses_compressed_kv_attention",
-                return_value=True,
+                return_value=qwen4_cfg,
             ),
         ):
             args = make_args(16384)

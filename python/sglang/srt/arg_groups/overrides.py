@@ -2187,7 +2187,7 @@ def prefill_chunk_tail_tolerance(server_args: Any) -> int:
     consistently to ``chunked_prefill_size + tolerance``.
 
     Controlled by ``SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE``:
-    - ``-1`` (default): auto-enabled only for compressed-KV (QSA) models;
+    - ``-1`` (default): auto-enabled only for Qwen4-Exp (QSA) models;
     - ``0``: disabled for all models;
     - ``> 0``: explicit token cap (clamped to ``chunked_prefill_size // 32``).
     """
@@ -2214,13 +2214,13 @@ def prefill_chunk_tail_tolerance(server_args: Any) -> int:
     if override > 0:
         return min(override, max_allowed)
 
-    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+    from sglang.srt.configs.model_config import is_qwen4_exp
 
     try:
         model_config = model_config_of(server_args)
     except Exception:
         model_config = None
-    if model_config is None or not uses_compressed_kv_attention(model_config.hf_config):
+    if model_config is None or not is_qwen4_exp(model_config.hf_config):
         return 0
     return max_allowed
 

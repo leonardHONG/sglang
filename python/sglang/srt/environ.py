@@ -1835,7 +1835,7 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Small chunk overflow tolerance (tokens) in PrefillAdder to avoid splitting tiny tail chunks.
-    # -1 (default): auto-enabled only for compressed-KV (QSA) models; 0: disabled; >0: explicit token cap.
+    # -1 (default): auto-enabled only for Qwen4-Exp (QSA) models; 0: disabled; >0: explicit token cap.
     SGLANG_PREFILL_CHUNK_TAIL_TOLERANCE = EnvInt(-1)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
