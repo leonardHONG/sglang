@@ -1126,7 +1126,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_prefill_graph_max_tokens=_prefill_graph_max_tokens(
                 self.target_worker.model_runner.prefill_cuda_graph_runner
             ),
-            is_qsa_mtp=self._split_prefill_is_qsa_mtp,
         ):
             return self._draft_extend_for_prefill_split(
                 batch,
@@ -1173,46 +1172,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _can_split_prefill_draft_extend(self) -> bool:
-        self._split_prefill_is_qsa_mtp = False
         if not _is_cuda:
             return False
         from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
-        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 
         model = self.draft_runner.model
         kv_cache_dtype = self.draft_runner.kv_cache_dtype
-        is_deepseek_nextn = isinstance(model, DeepseekV3ForCausalLMNextN)
-        is_qwen4_mtp = isinstance(model, Qwen4ExpForCausalLMMTP)
-        if not (is_deepseek_nextn or is_qwen4_mtp):
-            return False
-        if not model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype):
-            return False
-        if (
-            is_deepseek_nextn
+        return (
+            isinstance(model, DeepseekV3ForCausalLMNextN)
+            and model.supports_forward_kv_only(kv_cache_dtype=kv_cache_dtype)
             # With an FP8 cache and no prefix, these DSA prefills read fresh KV,
             # while the last-token pass reads the cache; flashmla_auto may pick one.
-            and kv_cache_dtype == torch.float8_e4m3fn
-            and get_exec().kernel.dsa_prefill_backend
-            in (
-                "flashmla_sparse",
-                "flashmla_sparse_q8",
-                "triton_sparse_mla",
-                "flashmla_auto",
+            and not (
+                kv_cache_dtype == torch.float8_e4m3fn
+                and get_exec().kernel.dsa_prefill_backend
+                in (
+                    "flashmla_sparse",
+                    "flashmla_sparse_q8",
+                    "triton_sparse_mla",
+                    "flashmla_auto",
+                )
             )
-        ):
-            return False
-        if (
-            get_parallel().attn_dp_enabled
-            or get_parallel().enable_prefill_cp
+            and not get_parallel().attn_dp_enabled
+            and not get_parallel().enable_prefill_cp
             # The split is not validated with decode context parallel's KV layout.
-            or get_parallel().dcp_enabled
+            and not get_parallel().dcp_enabled
             # The indexer top-k capturer copies the top-k rows per forward; the KV-only
             # pass computes none. Read the flag: this runs before the capturer exists.
-            or get_exec().features.enable_return_indexer_topk
-        ):
-            return False
-        self._split_prefill_is_qsa_mtp = is_qwen4_mtp
-        return True
+            and not get_exec().features.enable_return_indexer_topk
+        )
 
     def _draft_extend_for_prefill_split(
         self,
@@ -1250,11 +1238,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.forward(forward_batch)
 
         # The draft model embeds each last row from its tail token.
-        # For text-only QSA MTP, replay the captured draft-extend CUDA graph
-        # (1 token per request) instead of running eager extend (~8ms CPU).
-        has_mm = mm_input_embeds is not None or any(
-            x is not None for x in (getattr(last_batch, "multimodal_inputs", None) or ())
-        )
         return self._run_draft_extend_for_prefill(
             last_batch,
             target_hidden_states=target_hidden_states[last_rows],
@@ -1264,12 +1247,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ),
             iteration_ids=iteration_ids,
             write_cols=None if iteration_ids is None else last_rows,
-            use_draft_extend_graph=(
-                self._split_prefill_is_qsa_mtp
-                and not has_mm
-                and not self.seed_dsa_topk_from_draft_extend
-                and not self.speculative_algorithm.is_standalone()
-            ),
         )
 
     def _run_draft_extend_for_prefill(
@@ -1281,7 +1258,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         mm_input_embeds: Optional[torch.Tensor],
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
-        use_draft_extend_graph: bool = False,
     ) -> EagleDraftInput:
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -1327,52 +1303,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             ).long()
 
-        graph_runner = self.cuda_graph_runner_for_draft_extend
-        ran_graph = False
-        if (
-            use_draft_extend_graph
-            and graph_runner is not None
-            and not forward_batch.forward_mode.is_idle()
-            and not get_parallel().attn_dp_enabled
-            and forward_batch.batch_size <= graph_runner.max_bs
-            and forward_batch.input_ids.shape[0] == forward_batch.batch_size
-            and (
-                not graph_runner.disable_padding
-                or forward_batch.batch_size in graph_runner.capture_bs
-            )
-        ):
-            raw_bs = forward_batch.batch_size
-            orig_mode = forward_batch.forward_mode
-            orig_num_toks = forward_batch.spec_info.num_tokens_per_req
-            forward_batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-            forward_batch.spec_info.num_tokens_per_req = graph_runner.captured_req_width
-            if graph_runner.can_run_graph(forward_batch):
-                forward_batch.spec_info.num_correct_drafts = torch.zeros(
-                    raw_bs, dtype=torch.int32, device=self.device
-                )
-                forward_batch.spec_info.num_accept_tokens = torch.ones(
-                    raw_bs, dtype=torch.int32, device=self.device
-                )
-                if (
-                    self.draft_runner.model_config.model_is_mrope
-                    and forward_batch.mrope_positions is None
-                ):
-                    forward_batch.mrope_positions = (
-                        forward_batch.positions.unsqueeze(0).expand(3, -1).contiguous()
-                    )
-                select_index = torch.arange(
-                    raw_bs, dtype=torch.int64, device=self.device
-                )
-                with self._draft_canary_ctx(forward_batch):
-                    logits_output = graph_runner.execute(forward_batch, select_index)
-                ran_graph = True
-            else:
-                forward_batch.forward_mode = orig_mode
-                forward_batch.spec_info.num_tokens_per_req = orig_num_toks
-
-        if not ran_graph:
-            with self._draft_canary_ctx(forward_batch):
-                logits_output = self.draft_runner.forward(forward_batch).logits_output
+        with self._draft_canary_ctx(forward_batch):
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
